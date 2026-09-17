@@ -91,4 +91,4 @@ ndarray往返。发布交接13项测试通过。实际GPU/API/UI验收已完成�
 
 完整证据与回退步骤在Hub仓库
 `docs/proposals/model-compute-pool/pymss-online-2026-09-17.md`。
-两个组织fork已建立；hub分支接管提交目前只在本地，尚未push。
+两个组织fork已建立；2026-09-17按用户要求完成两个`hub`分支push，并核对远端SHA。
