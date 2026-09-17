@@ -47,6 +47,7 @@ class MelBandRoformer(RoformerRuntimeMixin, Module):
         match_input_audio_length=False,
         mlp_expansion_factor=4,
         mlp_hidden_layers=None,
+        use_shared_bias=False,
         **kwargs,
     ):
         super().__init__()

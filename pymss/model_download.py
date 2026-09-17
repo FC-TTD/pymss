@@ -25,6 +25,7 @@ HF_BASE_URL = f"https://huggingface.co/{HF_REPO}/resolve/main"
 MS_BASE_URL = f"https://www.modelscope.cn/models/{MS_REPO}/resolve/master"
 MS_FILES_API = f"https://www.modelscope.cn/api/v1/models/{MS_REPO}/repo/files?Revision=master&Recursive=true"
 MODEL_FILE_SUFFIXES = {".ckpt", ".th", ".pth", ".chpt", ".safetensors", ".pt", ".yaml", ".yml", ".json"}
+METADATA_FILE_SUFFIXES = {".yaml", ".yml", ".json"}
 ARIA2C_PATH = shutil.which("aria2c")
 
 
@@ -131,6 +132,11 @@ def _expected_size_and_hash(relpath, source_index):
     size = item.get("Size")
     sha256 = item.get("Sha256") or ""
     return int(size) if size else None, sha256
+
+
+def _is_metadata_file(relpath):
+    """Return true for small model metadata/config sidecar files."""
+    return Path(relpath).suffix.lower() in METADATA_FILE_SUFFIXES
 
 
 def _already_valid(path, expected_size=None, expected_sha256=""):
@@ -363,6 +369,8 @@ def download_model(model_name, model_dir=None, source="modelscope", endpoint=Non
 
     for relpath, dest in files:
         expected_size, expected_sha256 = _expected_size_and_hash(relpath, index)
+        if _is_metadata_file(relpath):
+            expected_size, expected_sha256 = None, ""
         if not force and _already_valid(dest, expected_size, expected_sha256):
             skipped.append(str(dest))
             continue

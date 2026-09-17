@@ -266,7 +266,7 @@ def _parse_json_request_body(body, loaded, state):
 
     stems = normalize_stems(payload.get("stems"), loaded.instruments)
     response_format = str(payload.get("response_format", "json")).lower()
-    output_audio_format = str(payload.get("output_audio_format", "pcm_f32le")).lower()
+    output_audio_format = str(payload.get("output_audio_format", "wav")).lower()
     validate_common_options(response_format, output_audio_format)
     mix, seconds = decode_pcm(
         raw,
@@ -299,7 +299,7 @@ def _parse_binary_request_body(request, body, loaded, state):
     channels = parse_int(params.get("channels"), "channels", code="invalid_query_parameter")
     stems = normalize_stems(params.get("stems"), loaded.instruments)
     response_format = str(params.get("response_format", "json")).lower()
-    output_audio_format = str(params.get("output_audio_format", "pcm_f32le")).lower()
+    output_audio_format = str(params.get("output_audio_format", "wav")).lower()
     validate_common_options(response_format, output_audio_format)
     mix, seconds = decode_pcm(
         body,
@@ -915,7 +915,7 @@ def create_app(config):
 
         try:
             if response_format == "json":
-                return json_response(loaded, model, results, stems, input_seconds)
+                return json_response(loaded, model, results, stems, input_seconds, output_audio_format)
 
             content = zip_response(loaded, model, results, stems, input_seconds, output_audio_format)
             return Response(content=content, media_type="application/zip")

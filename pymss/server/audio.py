@@ -16,6 +16,7 @@ from ..audio_io import save_audio
 from .errors import APIError
 
 
+OUTPUT_WAV_SAMPLE_RATE = 48000
 PCM_FORMATS = {
     "pcm_f32le": (np.dtype("<f4"), 4),
     "pcm_s16le": (np.dtype("<i2"), 2),
@@ -96,13 +97,6 @@ def validate_common_options(response_format, output_audio_format):
             400,
             "invalid_output_audio_format",
             f"Unsupported output_audio_format {output_audio_format!r}.",
-            param="output_audio_format",
-        )
-    if response_format == "json" and output_audio_format != "pcm_f32le":
-        raise APIError(
-            400,
-            "invalid_output_audio_format",
-            "response_format='json' only supports output_audio_format='pcm_f32le'.",
             param="output_audio_format",
         )
 
@@ -234,11 +228,37 @@ def _encode_container(audio, sample_rate, output_format, audio_params):
 
     Returns:
         Any: Computed result."""
+    encode_params = dict(audio_params or {})
+    if output_format == "wav":
+        encode_params["wav_bit_depth"] = "PCM_24"
+
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, f"audio.{output_format}")
-        save_audio(path, audio, sample_rate, output_format, audio_params)
+        save_audio(path, audio, sample_rate, output_format, encode_params)
         with open(path, "rb") as f:
             return f.read()
+
+
+def _resample_audio(audio, source_sample_rate, target_sample_rate):
+    """Resample sample-major mono/stereo audio for final file output."""
+    if source_sample_rate == target_sample_rate:
+        return audio
+
+    from math import gcd
+
+    from scipy.signal import resample_poly
+
+    divisor = gcd(int(source_sample_rate), int(target_sample_rate))
+    up = int(target_sample_rate) // divisor
+    down = int(source_sample_rate) // divisor
+    return np.asarray(resample_poly(audio, up, down, axis=0), dtype=np.float32)
+
+
+def _container_audio(audio, source_sample_rate, output_format):
+    """Return sample-major audio and the sample rate to encode."""
+    sample_major, channels = audio_to_interleaved_f32(audio)
+    target_sample_rate = OUTPUT_WAV_SAMPLE_RATE if output_format == "wav" else source_sample_rate
+    return _resample_audio(sample_major, source_sample_rate, target_sample_rate), target_sample_rate, channels
 
 
 def ordered_results(results, stems, instruments):
@@ -263,7 +283,7 @@ def ordered_results(results, stems, instruments):
     return [(stem, results[stem]) for stem in order]
 
 
-def json_response(loaded, model, results, stems, input_seconds):
+def json_response(loaded, model, results, stems, input_seconds, output_audio_format):
     """Build a JSON separation response with base64 audio payloads.
 
     Args:
@@ -277,15 +297,31 @@ def json_response(loaded, model, results, stems, input_seconds):
         Any: Computed result."""
     outputs = []
     for stem, audio in ordered_results(results, stems, loaded.instruments):
-        raw, channels = f32le_bytes(audio)
+        if output_audio_format == "pcm_f32le":
+            content, channels = f32le_bytes(audio)
+            output_sample_rate = loaded.sample_rate
+            format_name = "pcm_f32le"
+        else:
+            output_audio, output_sample_rate, channels = _container_audio(
+                audio,
+                loaded.sample_rate,
+                output_audio_format,
+            )
+            content = _encode_container(
+                output_audio,
+                output_sample_rate,
+                output_audio_format,
+                loaded.audio_params,
+            )
+            format_name = output_audio_format
         outputs.append(
             {
                 "stem": stem,
                 "audio": {
-                    "format": "pcm_f32le",
-                    "sample_rate": loaded.sample_rate,
+                    "format": format_name,
+                    "sample_rate": output_sample_rate,
                     "channels": channels,
-                    "data": base64.b64encode(raw).decode("ascii"),
+                    "data": base64.b64encode(content).decode("ascii"),
                 },
             }
         )
@@ -328,15 +364,20 @@ def zip_response(loaded, model, results, stems, input_seconds, output_audio_form
             filename = _filename(index, stem, output_audio_format)
             if output_audio_format == "pcm_f32le":
                 content, channels = f32le_bytes(audio)
+                output_sample_rate = loaded.sample_rate
                 format_name = "pcm_f32le"
             else:
-                content = _encode_container(
+                output_audio, output_sample_rate, channels = _container_audio(
                     audio,
                     loaded.sample_rate,
                     output_audio_format,
+                )
+                content = _encode_container(
+                    output_audio,
+                    output_sample_rate,
+                    output_audio_format,
                     loaded.audio_params,
                 )
-                _, channels = audio_to_interleaved_f32(audio)
                 format_name = output_audio_format
             zf.writestr(filename, content)
             output_items.append(
@@ -344,7 +385,7 @@ def zip_response(loaded, model, results, stems, input_seconds, output_audio_form
                     "stem": stem,
                     "filename": filename,
                     "format": format_name,
-                    "sample_rate": loaded.sample_rate,
+                    "sample_rate": output_sample_rate,
                     "channels": channels,
                 }
             )

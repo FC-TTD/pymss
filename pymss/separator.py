@@ -3,7 +3,7 @@ import os
 import logging
 import re
 from contextlib import contextmanager, nullcontext
-from collections import deque
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 import torch
 import numpy as np
@@ -62,6 +62,14 @@ PASSTHROUGH_INFERENCE_PARAMS = frozenset(
         "split",
     }
 )
+
+
+class _AdamW8bitCheckpointStub:
+    """Checkpoint-only placeholder for bitsandbytes optimizer metadata."""
+
+
+_AdamW8bitCheckpointStub.__module__ = "bitsandbytes.optim.adamw"
+_AdamW8bitCheckpointStub.__qualname__ = "AdamW8bit"
 FAST_INIT_MODEL_TYPES = {"bs_roformer", "bs_roformer_hyperace", "mel_band_roformer"}
 LEGACY_DEMUCS_MODEL_TYPES = {"demucs", "tasnet", "legacy_demucs", "legacy_tasnet"}
 OUTPUT_NORMALIZE_TARGET_DBFS = -0.01
@@ -191,10 +199,18 @@ def _load_state_dict(model_type, model_path, device):
     if model_type == "apollo":
         model_path = _apollo_state_dict_path(model_path)
         return _unwrap_state_dict(torch.load(model_path, map_location=map_location, weights_only=False))
+    safe_globals = [
+        dict,
+        defaultdict,
+        torch.optim.lr_scheduler.ReduceLROnPlateau,
+        _AdamW8bitCheckpointStub,
+    ]
     try:
-        return _unwrap_state_dict(torch.load(model_path, map_location=map_location, weights_only=True, mmap=True))
+        with torch.serialization.safe_globals(safe_globals):
+            return _unwrap_state_dict(torch.load(model_path, map_location=map_location, weights_only=True, mmap=True))
     except (TypeError, ValueError, RuntimeError):
-        return _unwrap_state_dict(torch.load(model_path, map_location=map_location, weights_only=True))
+        with torch.serialization.safe_globals(safe_globals):
+            return _unwrap_state_dict(torch.load(model_path, map_location=map_location, weights_only=True))
 
 
 @contextmanager
@@ -311,6 +327,91 @@ def _infer_mel_band_roformer_mlp_hidden_layers(state_dict):
     if not layer_indices:
         return None
     return len(layer_indices) - 1
+
+
+def _infer_mel_band_roformer_dim(state_dict):
+    """Infer MelBand RoFormer model dim from checkpoint tensor shapes."""
+    for key, value in state_dict.items():
+        if key.startswith("band_split.to_features.") and key.endswith(".1.weight") and hasattr(value, "shape"):
+            return int(value.shape[0])
+    pattern = re.compile(r"(?:^|\.)layers\.\d+\.\d+\.layers\.\d+\.\d+\.norm\.gamma$")
+    for key, value in state_dict.items():
+        if pattern.search(key) and hasattr(value, "shape") and value.ndim == 1:
+            return int(value.shape[0])
+    return None
+
+
+def _infer_mel_band_roformer_depth(state_dict):
+    """Infer MelBand RoFormer depth from checkpoint layer indices."""
+    pattern = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    layer_indices = sorted({int(match.group(1)) for key in state_dict for match in [pattern.search(key)] if match})
+    return len(layer_indices) if layer_indices else None
+
+
+def _infer_mel_band_roformer_num_stems(state_dict):
+    """Infer MelBand RoFormer output head count from checkpoint mask estimators."""
+    pattern = re.compile(r"(?:^|\.)mask_estimators\.(\d+)\.")
+    stem_indices = sorted({int(match.group(1)) for key in state_dict for match in [pattern.search(key)] if match})
+    return len(stem_indices) if stem_indices else None
+
+
+def _infer_mel_band_roformer_model_kwargs(state_dict):
+    """Infer robust MelBand RoFormer constructor overrides from checkpoint weights."""
+    inferred = {
+        "dim": _infer_mel_band_roformer_dim(state_dict),
+        "depth": _infer_mel_band_roformer_depth(state_dict),
+        "num_stems": _infer_mel_band_roformer_num_stems(state_dict),
+        "mlp_hidden_layers": _infer_mel_band_roformer_mlp_hidden_layers(state_dict),
+    }
+    return {key: value for key, value in inferred.items() if value is not None}
+
+
+def _single_stem_name_from_model_path(model_path):
+    """Choose a stable runtime stem name when checkpoint has one output head."""
+    name = os.path.basename(str(model_path)).lower()
+    if "karaoke" in name or "instrumental" in name or re.search(r"(^|[_-])inst($|[_-])", name):
+        return "instrumental"
+    if "vocals" in name or "vocal" in name:
+        return "vocals"
+    if "denoise" in name:
+        return "speech"
+    if "dereverb" in name or "de_reverb" in name:
+        return "dry"
+    return "stem"
+
+
+def _apply_inferred_runtime_config(config, model_kwargs_override, model_path, logger=None):
+    """Keep runtime config aligned with checkpoint-inferred model shape."""
+    if not model_kwargs_override:
+        return
+    for key, value in model_kwargs_override.items():
+        config.model[key] = value
+
+    num_stems = model_kwargs_override.get("num_stems")
+    if not num_stems:
+        return
+    instruments = list(config.training.get("instruments", []) or [])
+    if config.training.get("target_instrument") is not None or len(instruments) == num_stems:
+        return
+    if num_stems == 1:
+        inferred_name = _single_stem_name_from_model_path(model_path)
+        config.training.instruments = [inferred_name]
+        config.training.target_instrument = None
+        if logger:
+            logger.warning(
+                "Checkpoint output head count is 1 but config listed %d instruments; using runtime instrument %r",
+                len(instruments),
+                inferred_name,
+            )
+        return
+    if len(instruments) > num_stems:
+        config.training.instruments = instruments[:num_stems]
+        if logger:
+            logger.warning(
+                "Checkpoint output head count is %d but config listed %d instruments; truncating runtime instruments",
+                num_stems,
+                len(instruments),
+            )
 
 
 def _store_torch_model_on_cpu_for_mlx(config, device):
@@ -748,7 +849,6 @@ class MSSeparator:
         self.device = _select_device(device, self.device_ids, self.logger)
         self.inference_params = _prefer_mlx_for_auto(device, self.device, self.inference_params, self.logger)
 
-        self._cudnn_benchmark_initial = torch.backends.cudnn.benchmark
         torch.backends.cudnn.benchmark = True
         self.logger.info(f"Using device: {self.device}, device_ids: {self.device_ids}")
 
@@ -970,14 +1070,13 @@ class MSSeparator:
         model_type = _runtime_model_type(self.model_type, state_dict)
         model_kwargs_override = None
         if model_type == "mel_band_roformer":
-            model_kwargs_override = {
-                "mlp_hidden_layers": _infer_mel_band_roformer_mlp_hidden_layers(state_dict),
-            }
+            model_kwargs_override = _infer_mel_band_roformer_model_kwargs(state_dict)
 
         init_context = _skip_torch_default_init() if model_type in FAST_INIT_MODEL_TYPES else nullcontext()
         with init_context:
             model, config = get_model_from_config(model_type, self.config_path, model_kwargs_override=model_kwargs_override)
 
+        _apply_inferred_runtime_config(config, model_kwargs_override, self.model_path, self.logger)
         self.update_inference_params(config, self.inference_params)
         self.apply_model_inference_config(model, config)
 
@@ -1471,10 +1570,7 @@ class MSSeparator:
 
         Returns:
             None: Model references are dropped and CUDA/MPS/MLX caches are
-            cleared where available. The ``torch.backends.cudnn.benchmark``
-            flag is also restored to the value it held before the separator
-            was initialized, so embedding pymss in a larger pipeline does not
-            leak the benchmark-enabled side effect into other modules.
+            cleared where available.
 
         Example:
             >>> separator.close()"""
@@ -1496,30 +1592,10 @@ class MSSeparator:
                 except Exception as exc:
                     self.logger.debug(f"Could not move model to CPU during close: {exc}")
         finally:
-            self._restore_cudnn_benchmark()
             self.model = None
             self.config = None
             self.store_dirs = {}
             self.del_cache()
-
-    def _restore_cudnn_benchmark(self):
-        """Restore ``torch.backends.cudnn.benchmark`` to its pre-init value.
-
-        Args:
-            None: This callable does not accept user-provided arguments.
-
-        Returns:
-            None: When the separator captured an initial ``cudnn.benchmark``
-            value during initialization, the global flag is restored to that
-            value so downstream modules observe the same state as before
-            pymss ran."""
-        initial = getattr(self, "_cudnn_benchmark_initial", None)
-        if initial is None:
-            return
-        try:
-            torch.backends.cudnn.benchmark = initial
-        except Exception as exc:
-            self.logger.debug(f"Could not restore torch.backends.cudnn.benchmark: {exc}")
 
     def del_cache(self):
         """Run garbage collection and clear accelerator memory caches.
