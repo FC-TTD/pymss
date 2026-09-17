@@ -1,0 +1,18 @@
+services:
+  entry:
+    networks:
+      model: {}
+      caddy:
+        aliases: [pymss-studio]
+    labels: !override
+      ttd.hub.release: ${PYMSS_RELEASE:?}
+      caddy_ingress_network: caddy
+      caddy: http://pymss-studio
+      caddy.@root.method: GET HEAD
+      caddy.@root.path: /
+      caddy.redir: '@root /ui/ 302'
+      caddy.reverse_proxy: '{{upstreams 7860}}'
+      caddy.reverse_proxy.health_uri: /hub-entry/health
+      caddy.reverse_proxy.health_interval: 10s
+      caddy.reverse_proxy.health_timeout: 3s
+      caddy.reverse_proxy.health_status: '200'

@@ -1,0 +1,60 @@
+name: pymss-hub
+services:
+  runtime:
+    image: ${PYMSS_IMAGE:?fixed managed PYMSS image}
+    container_name: pymss-hub-runtime
+    restart: 'no'
+    command: [python, -m, hub_runtime]
+    environment:
+      HUB_SERVICE_ID: pymss
+      HUB_RUNTIME_VERSION: ${PYMSS_RUNTIME_VERSION:?}
+      HUB_RUNTIME_ACTOR_ID: ${PYMSS_ACTOR_ID:?}
+      HUB_RUNTIME_TOKEN: ${HUB_PYMSS_RUNTIME_TOKEN:?}
+      HUB_RUNTIME_STATE_DIR: /var/lib/hub-runtime/actors/${PYMSS_ACTOR_ID:?}
+      HUB_NODE_URL: http://host.docker.internal:13912
+      HUB_CONTROL_HOST: '0.0.0.0'
+      HUB_CONTROL_PORT: '18083'
+      HUB_GPU_PROCESS: '1'
+      CUDA_VISIBLE_DEVICES: ''
+      NVIDIA_VISIBLE_DEVICES: '${GPU_0:?},${GPU_1:?},${GPU_2:?}'
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYMSS_MODEL_DIR: /models
+      PYMSS_HUB_INITIAL_MODEL: BS-Roformer-Resurrection.ckpt
+      PYMSS_DOWNLOAD_SOURCE: hf-mirror
+      TZ: Asia/Shanghai
+    extra_hosts: ['host.docker.internal:host-gateway']
+    ports: ['127.0.0.1:13921:18083']
+    volumes:
+      - /opt/ttd-hub-v2/runtime-state/pymss:/var/lib/hub-runtime
+      - /TTD-Data/pymss/models:/models
+      - /TTD-Data/pymss/outputs:/outputs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${GPU_0:?}', '${GPU_1:?}', '${GPU_2:?}']
+              capabilities: [gpu]
+    networks: [model]
+    labels:
+      ttd.hub.instance: pymss
+      ttd.hub.release: ${PYMSS_RELEASE:?}
+      ttd.hub.dynamic_gpu: 'true'
+  entry:
+    image: ${HUB_IMAGE:?fixed Hub entry image}
+    container_name: pymss-hub-entry
+    restart: unless-stopped
+    entrypoint: [/usr/local/bin/model-entry]
+    command: [--upstream, 'http://runtime:8000', --listen, ':7860']
+    networks: [model, caddy]
+    labels:
+      ttd.hub.release: ${PYMSS_RELEASE:?}
+      caddy_ingress_network: caddy
+      caddy: http://pymss-pool-validation
+      caddy.@root.method: GET HEAD
+      caddy.@root.path: /
+      caddy.redir: '@root /ui/ 302'
+      caddy.reverse_proxy: '{{upstreams 7860}}'
+networks:
+  model: {}
+  caddy: {external: true}
