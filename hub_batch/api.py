@@ -87,7 +87,7 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
                             await asyncio.sleep(.25)
                     return StreamingResponse(one_event(), media_type="text/event-stream")
                 return result
-            except (ValueError, KeyError) as exc:
+            except (ValueError, KeyError, OSError) as exc:
                 raise HTTPException(400, str(exc)) from None
             except RuntimeError as exc:
                 raise HTTPException(429, str(exc)) from None

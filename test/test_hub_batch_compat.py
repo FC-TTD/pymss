@@ -6,6 +6,7 @@ import soundfile as sf
 from fastapi.testclient import TestClient
 
 from hub_batch.api import build_app
+from hub_batch.__main__ import default_profiles
 from hub_batch.engine import BatchEngine
 from hub_batch.msst_compat import CompatTasks
 from test.test_hub_batch import Separator
@@ -57,5 +58,16 @@ def test_legacy_status_uses_client_compatible_task_fields(tmp_path):
             assert response.status_code == 200
             assert response.json()["task_id"] == "task"
             assert response.json()["processed_files"] == 1
+    finally:
+        compat.close()
+
+
+def test_stable_profile_provider_shape_resolves_default_manifest(tmp_path):
+    engine = BatchEngine(str(tmp_path), separator_factory=lambda **kwargs: Separator())
+    compat = CompatTasks(Runtime(engine), tmp_path / "state", tmp_path, tmp_path / "out")
+    try:
+        with TestClient(build_app(None, compat=compat, profile_registry=default_profiles())) as client:
+            response = client.post("/v1/separations", json={"profile":"dialogue-vocal", "profile_version":"2026-09-20.v1", "inputs":[str(tmp_path / "missing.wav")], "output_dir":str(tmp_path / "out")})
+            assert response.status_code == 400
     finally:
         compat.close()
