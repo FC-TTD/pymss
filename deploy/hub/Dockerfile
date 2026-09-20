@@ -15,10 +15,12 @@ RUN python -m pip install --no-deps --no-cache-dir /tmp/hub-runtime-wheel/*.whl
 COPY pyproject.toml /tmp/pymss-upgrade/pyproject.toml
 RUN python -c 'import pathlib,re; text=pathlib.Path("/tmp/pymss-upgrade/pyproject.toml").read_text(); print(re.search(r"\"(pymss-core==[^\"]+)\"", text).group(1))' > /tmp/pymss-upgrade/core.txt
 RUN --mount=type=cache,target=/root/.cache/pip python -m pip install --no-deps -r /tmp/pymss-upgrade/core.txt
-RUN mv /app/pymss/server/webui_static /tmp/pymss-original-webui && rm -rf /app/pymss
+# Keep the native tree intact while avoiding recursive deletion of its overlay
+# directories. The same-filesystem rename leaves a clean path for the fork.
+RUN mv /app/pymss /app/pymss-native
 COPY pymss /app/pymss
 COPY pyproject.toml README.md LICENSE /app/
-RUN cp -a /tmp/pymss-original-webui/. /app/pymss/server/webui_static/ && rm -rf /tmp/pymss-original-webui
+RUN cp -a /app/pymss-native/server/webui_static/. /app/pymss/server/webui_static/
 RUN --mount=type=cache,target=/root/.cache/pip python -m pip install --no-deps --no-build-isolation -e /app
 COPY hub_runtime /app/hub_runtime
 COPY hub_batch /app/hub_batch
