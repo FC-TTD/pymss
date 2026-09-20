@@ -14,7 +14,8 @@ class DummyLogger:
         pass
 
 
-def test_device_mlx_enables_clear_cache_by_default():
+def test_device_mlx_enables_clear_cache_by_default(monkeypatch):
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     device, params = _resolve_public_device("mlx", {}, DummyLogger())
 
     assert device == "mps"

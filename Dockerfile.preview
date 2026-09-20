@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:24-bookworm-slim AS webui
+WORKDIR /webui
+COPY pymss-webui/package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY pymss-webui/ ./
+RUN npm run build
+
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    PYMSS_MODEL_DIR=/models \
+    GRADIO_SERVER_NAME=0.0.0.0
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg libsndfile1 git curl tini \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml README.md README_CN.md LICENSE ./
+COPY pymss ./pymss
+COPY --from=webui /webui/dist/ ./pymss/server/webui_static/
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --resume-retries 5 --timeout 60 --retries 8 --prefer-binary \
+      "threadpoolctl>=3.6,<4" \
+      "scikit-learn==1.9.0" \
+      "scipy==1.17.1" \
+      "numba==0.65.1" \
+      "llvmlite==0.47.0" \
+    && pip install --resume-retries 5 --timeout 60 --retries 8 --prefer-binary \
+      -e ".[server]" "typing-extensions==4.14.0"
+
+EXPOSE 7860
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["pymss", "serve", "1_HP-UVR", "--model-dir", "/models", "--source", "hf-mirror", "--device", "cuda", "--device-id", "0", "--host", "0.0.0.0", "--port", "7860", "--webui", "--max-queue-size", "1"]

@@ -1,0 +1,44 @@
+name: pymss-studio-preview
+
+services:
+  pymss-studio:
+    image: pymss-studio-preview:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.preview
+      network: host
+    restart: unless-stopped
+    ports:
+      - "17867:7860"
+    environment:
+      PYMSS_MODEL_DIR: /models
+      NVIDIA_VISIBLE_DEVICES: "2"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - /TTD-Data/pymss/models:/models
+      - /TTD-Data/pymss/outputs:/outputs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7860/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - caddy
+    labels:
+      caddy: "http://pymss-studio"
+      caddy.@root.method: "GET HEAD"
+      caddy.@root.path: "/"
+      caddy.redir: "@root /ui/ 302"
+      caddy.reverse_proxy: "{{upstreams 7860}}"
+
+networks:
+  caddy:
+    external: true

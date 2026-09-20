@@ -309,9 +309,12 @@ class SeparatorCache:
     and are NOT part of the key.
     """
 
-    def __init__(self, factory: Callable[..., Any] | None = None) -> None:
+    def __init__(self, factory: Callable[..., Any] | None = None, *, max_entries: int | None = None) -> None:
+        if max_entries is not None and max_entries < 1:
+            raise ValueError("max_entries must be positive when provided")
         self._entries: dict[str, Any] = {}
         self._factory = factory or self._default_factory
+        self._max_entries = max_entries
 
     @staticmethod
     def _default_factory(**kwargs: Any) -> Any:
@@ -337,6 +340,21 @@ class SeparatorCache:
         key = self.key_for(**kwargs)
         entry = self._entries.get(key)
         if entry is None:
+            # A Hub managed provider can opt into single residency.  DAG
+            # outputs are materialized before the next node asks for a model,
+            # so evicting here keeps the graph's memory contract without
+            # changing the general purpose cache's default multi-model
+            # behavior.
+            if self._max_entries is not None and len(self._entries) >= self._max_entries:
+                old_entries = list(self._entries.values())
+                self._entries.clear()
+                for old in old_entries:
+                    close = getattr(old, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:  # pragma: no cover - best effort
+                            pass
             entry = self._factory(**kwargs)
             self._entries[key] = entry
         return entry

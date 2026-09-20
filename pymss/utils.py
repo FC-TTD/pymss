@@ -97,6 +97,16 @@ def get_model_from_config(model_type, config_path, model_kwargs_override=None):
     if model_type in {"mel_band_roformer", "mel_band_conformer"}:
         model_kwargs_override = dict(model_kwargs_override or {})
         model_kwargs_override.setdefault("zero_dc", False)
+        if model_type == "mel_band_roformer":
+            config = load_config(config_path)
+            if "use_shared_bias" in config.model or "use_shared_bias" in model_kwargs_override:
+                # The deployed MelBand constructor accepted but ignored this
+                # field. Keep that compatibility outside the upstream core.
+                from pymss_core.modules.bs_roformer import MelBandRoformer
+
+                kwargs = {**config.model, **model_kwargs_override}
+                kwargs.pop("use_shared_bias", None)
+                return MelBandRoformer(**kwargs), config
         return _core_get_model_from_config(
             model_type, config_path, model_kwargs_override=model_kwargs_override
         )

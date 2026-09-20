@@ -381,4 +381,3 @@ def test_run_dag_returns_structured_records(tone_file, tmp_path):
     record_dict = record.to_dict()
     assert record_dict["path"] == record.path
     assert record_dict["format"] == "wav"
-

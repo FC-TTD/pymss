@@ -1,0 +1,15 @@
+name: pymss-handoff-guard
+services:
+  guard:
+    image: ${HUB_IMAGE:?fixed Hub image}
+    container_name: pymss-handoff-guard
+    entrypoint: [/bin/sh, -c, 'exec sleep infinity']
+    restart: unless-stopped
+    networks: [caddy]
+    labels:
+      hub.pymss.role: legacy-admission-guard
+      hub.pymss.operation: ${PYMSS_RELEASE:?}
+      caddy: http://pymss-studio
+      caddy.0_route.0_respond: '"pymss-maintenance:${PYMSS_RELEASE:?}" 503'
+networks:
+  caddy: {external: true}
