@@ -147,6 +147,8 @@ def _require_loaded_for_inference(state):
     loaded = state.loaded
     if loaded is None:
         raise APIError(503, "model_not_loaded", "No model is currently loaded.", param="model")
+    if not loaded.instruments:
+        raise APIError(503, "model_not_loaded", "Model configuration is unavailable; load the model with /v1/models/load first.", param="model")
     return loaded
 
 
@@ -472,6 +474,8 @@ def _parse_download_payload(payload):
         raise APIError(400, "invalid_request", "timeout_seconds must be a number.", param="timeout_seconds")
     if timeout <= 0:
         raise APIError(400, "invalid_request", "timeout_seconds must be greater than 0.", param="timeout_seconds")
+    if timeout.is_integer():
+        timeout = int(timeout)
     return str(model), source, endpoint, force, verify, timeout
 
 

@@ -22,7 +22,22 @@ separator = MSSeparator.from_model_name(
 separator.process_folder("path/to/input_file_or_folder")
 ```
 
-`from_model_name()` resolves the model type, weight path, and config path from the pymss model catalog, then forwards the remaining keyword arguments to `MSSeparator(...)`.
+`from_model_name()` resolves the model type, weight path, and config path from the pymss model catalog or a locally registered user model, then forwards the remaining keyword arguments to `MSSeparator(...)`.
+
+To register a custom local model for reuse by name:
+
+```python
+from pymss import register_model, MSSeparator
+
+register_model(
+    "my_bs",
+    "bs_conformer",
+    "/path/model.ckpt",
+    "/path/config.yaml",
+    overlap_size=44100,
+)
+separator = MSSeparator.from_model_name("my_bs")
+```
 
 ## `from_model_name()` Parameters
 
@@ -33,7 +48,7 @@ separator.process_folder("path/to/input_file_or_folder")
 | `download` | `bool` | `False` | If `True`, missing model files are downloaded before loading. If `False`, loading fails when files are missing. |
 | `source` | `str` | `"modelscope"` | Download source passed to the model downloader. |
 | `endpoint` | `str \| None` | `None` | Optional downloader endpoint override. |
-| `**kwargs` | any | - | Forwarded directly to `MSSeparator(...)`, such as `device`, `output_format`, `store_dirs`, `audio_params`, `debug`, and `inference_params`. |
+| `**kwargs` | any | - | Forwarded directly to `MSSeparator(...)`, such as `device`, `output_format`, `store_dirs`, `save_as_folder`, `audio_params`, `debug`, and `inference_params`. |
 
 ## Constructor
 
@@ -47,6 +62,7 @@ separator = MSSeparator(
     output_format="wav",
     use_tta=False,
     store_dirs="results",
+    save_as_folder=False,
     audio_params={
         "wav_bit_depth": "FLOAT",
         "flac_bit_depth": "PCM_24",
@@ -73,7 +89,7 @@ separator = MSSeparator(
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `model_type` | `str` | required | Model architecture/runtime type. Common values include `bs_roformer`, `mel_band_roformer`, `htdemucs`, `mdx23c`, `bandit`, `bandit_v2`, `scnet`, `apollo`, `vr`, `legacy_demucs`, and `legacy_tasnet`. Catalog users normally do not set this manually. |
+| `model_type` | `str` | required | Model architecture/runtime type. Common values include `bs_roformer`, `bs_conformer`, `mel_band_roformer`, `mel_band_conformer`, `htdemucs`, `mdx23c`, `bandit`, `bandit_v2`, `scnet`, `apollo`, `vr`, `legacy_demucs`, and `legacy_tasnet`. Catalog users normally do not set this manually. |
 | `model_path` | `str` | required | Path to the model weights file. The extension depends on the model family, for example `.ckpt`, `.th`, or `.pth`. |
 | `config_path` | `str \| None` | `None` | YAML config path for MSS-style models. If omitted, pymss tries `model_path + ".yaml"`. VR models are loaded from built-in VR metadata and do not use an MSS YAML config. |
 | `device` | `str` | `"auto"` | Runtime device. Valid values are `auto`, `cpu`, `cuda`, `mps`, and `mlx`. `auto` chooses CUDA first, then Apple MPS, then CPU. `mlx` is a public shortcut for the Apple Silicon MLX backend and internally runs through `device="mps"` with MLX model settings. |
@@ -81,10 +97,11 @@ separator = MSSeparator(
 | `output_format` | `str` | `"wav"` | File format used by `process_folder()` and `save_audio()`. Supported values are `wav`, `flac`, `mp3`, and `m4a`. |
 | `use_tta` | `bool` | `False` | Enables test-time augmentation. For MSS models this runs multiple transformed variants and merges the result. It may improve quality slightly, but it increases inference time. |
 | `store_dirs` | `str \| dict` | `"results"` | Output destination used by `process_folder()`. A string writes every saved stem to the same folder. A dict maps stem names to a folder, a list of folders, `None`, or an empty value. `None` or a missing stem means that stem is not saved. |
+| `save_as_folder` | `bool` | `False` | When `True` and `store_dirs` resolves to one output folder, each input audio file gets its own subfolder named after the audio basename, for example `results/song/song_vocals.wav`. This applies when `store_dirs` is a single path, or when every saved dict destination points to the same folder. |
 | `audio_params` | `dict` | see below | Encoding options used when saving audio. |
 | `logger` | `logging.Logger \| None` | `None` | Logger instance. If omitted, pymss uses `pymss.get_separation_logger()`. |
 | `debug` | `bool` | `False` | Enables debug logging and disables some progress bar behavior intended for normal CLI-style output. |
-| `progress_callback` | callable \| `None` | `None` | Optional callback used by lower-level demixing code. It receives progress information from long-running inference loops. |
+| `progress_callback` | callable \| `None` | `None` | Optional callback used by lower-level demixing code. Demix progress is reported as `callback(done_seconds, total_seconds, message)`. |
 | `inference_params` | `dict` | see below | Runtime inference overrides. Keys are model-dependent. Unsupported keys are rejected by the server validation layer and ignored only when not passed to the relevant runtime path. |
 
 ## Output Routing With `store_dirs`
@@ -106,6 +123,19 @@ store_dirs = {
 ```
 
 This writes `vocals` to one folder, writes `instrumental` to two folders, and skips `drums`. Stem names are matched against the model config instruments. Invalid stem keys are removed during initialization and logged as warnings.
+
+Set `save_as_folder=True` when all saved stems should be grouped by input audio file:
+
+```python
+separator = MSSeparator.from_model_name(
+    "bs_roformer_voc_hyperacev2",
+    store_dirs="results",
+    save_as_folder=True,
+)
+separator.process_folder("song.wav")
+```
+
+This writes stems to `results/song/`, such as `results/song/song_vocals.wav` and `results/song/song_instrumental.wav`. The option is active only when `store_dirs` is a single folder path, or when every saved destination in a `dict` points to the same folder. If different stems are routed to different folders, pymss keeps the normal `store_dirs` layout.
 
 When `inference_params["normalize"]` is enabled, pymss separates all stems that will be saved together so the shared output normalization gain is computed across those stems. If you save only two stems from a six-stem model, those two saved stems are normalized together.
 

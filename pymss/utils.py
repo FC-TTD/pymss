@@ -3,93 +3,85 @@ from contextlib import contextmanager, nullcontext
 import numpy as np
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 from numpy.typing import NDArray
 from typing import Dict
 
+from pymss_core import get_model_from_config as _core_get_model_from_config
+
 from .config import load_config
+from .progress import _ProgressContext
 
 
-class _ProgressContext:
-    """Small progress adapter used by demixing helpers.
+def apply_msst_inference_compat(config, logger=None, *, user_set_chunk_size=False):
+    """Normalize MSST-style ``num_overlap`` / ``inference.chunk_size`` for pymss.
+
+    MSST configs often set ``inference.num_overlap`` and optionally
+    ``inference.chunk_size``. pymss demix uses ``audio.chunk_size`` and
+    ``inference.overlap_size``, where::
+
+        step = chunk_size - overlap_size
+        # MSST equivalent: step = chunk_size // num_overlap
+
+    so ``overlap_size = chunk_size - chunk_size // num_overlap``.
 
     Args:
-        pbar (Any, optional): Pbar value. Defaults to False.
-        total (Any, optional): Total value. Defaults to 1.
-        callback (Any, optional): Callback value. Defaults to None.
-        done (Any, optional): Done value. Defaults to 0.
-        message (str, optional): Message value. Defaults to 'Processing audio chunks'.
+        config: Loaded model configuration.
+        logger: Optional logger for a one-time conversion warning.
+        user_set_chunk_size: When True, keep ``audio.chunk_size`` from an
+            explicit ``inference_params`` override instead of copying
+            ``inference.chunk_size``.
+
+    Returns:
+        The same config object after in-place normalization.
     """
+    inference = getattr(config, "inference", None)
+    audio = getattr(config, "audio", None)
+    if inference is None or audio is None:
+        return config
 
-    def __init__(self, pbar=False, total=1, callback=None, done=0, message="Processing audio chunks"):
-        """Initialize the instance.
+    if not user_set_chunk_size and inference.get("chunk_size") is not None:
+        audio["chunk_size"] = int(inference["chunk_size"])
 
-        Args:
-            pbar (Any, optional): Pbar value. Defaults to False.
-            total (Any, optional): Total value. Defaults to 1.
-            callback (Any, optional): Callback value. Defaults to None.
-            done (Any, optional): Done value. Defaults to 0.
-            message (str, optional): Message value. Defaults to 'Processing audio chunks'.
+    if audio.get("chunk_size") is None:
+        return config
 
-        Returns:
-            None: This method completes for its side effects."""
-        self.enabled = bool(pbar or callback)
-        self.bar = None
-        self.callback = callback
-        self.done = done
-        self.total = total
-        self.message = message
-        if not self.enabled:
-            return
-        self.bar = tqdm(total=total, desc=message, leave=False) if pbar else None
-        self.total = int(self.total or 1)
-        self.done = int(self.done or 0)
-        self.emit()
+    chunk_size = int(audio["chunk_size"])
+    inference["chunk_size"] = chunk_size
 
-    def emit(self, done=None):
-        """Emit value.
+    if inference.get("overlap_size") is not None:
+        return config
 
-        Args:
-            done (Any, optional): Done value. Defaults to None.
+    num_overlap = inference.get("num_overlap")
+    if num_overlap is None:
+        return config
 
-        Returns:
-            None: This callable completes for its side effects."""
-        if not self.enabled:
-            return
-        if done is not None:
-            self.done = int(done)
-        if self.callback is None:
-            return
-        self.callback(min(self.done, self.total), self.total, self.message)
+    num_overlap = int(num_overlap)
+    if num_overlap < 1:
+        raise ValueError(f"inference.num_overlap must be >= 1, got {num_overlap}")
 
-    def update(self, amount):
-        """Update value.
+    overlap_size = chunk_size - (chunk_size // num_overlap)
+    if overlap_size < 0 or overlap_size >= chunk_size:
+        raise ValueError(
+            f"converted overlap_size={overlap_size} from num_overlap={num_overlap} "
+            f"is invalid for chunk_size={chunk_size}"
+        )
+    inference["overlap_size"] = overlap_size
 
-        Args:
-            amount (Any): Amount value.
+    suggested = max(1, chunk_size // 20)
+    message = (
+        f"Config has inference.num_overlap={num_overlap} but no overlap_size; "
+        f"set overlap_size={overlap_size} to match MSST "
+        f"(step=chunk_size/{num_overlap}={chunk_size // num_overlap}). "
+        f"For faster inference, pass a smaller overlap_size "
+        f"(e.g. ~5% of chunk_size ≈ {suggested})."
+    )
+    if logger is not None:
+        logger.warning(message)
+    return config
 
-        Returns:
-            None: This callable completes for its side effects."""
-        if not self.enabled:
-            return
-        amount = int(amount)
-        if self.bar:
-            self.bar.update(amount)
-        self.done += amount
-        self.emit()
 
-    def close(self):
-        """Close value.
-
-        Args:
-            None: This callable does not accept user-provided arguments.
-
-        Returns:
-            None: This method completes for its side effects."""
-        if not self.enabled:
-            return
-        if self.bar:
-            self.bar.close()
+def _model_target(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
 
 
 def get_model_from_config(model_type, config_path, model_kwargs_override=None):
@@ -102,50 +94,28 @@ def get_model_from_config(model_type, config_path, model_kwargs_override=None):
 
     Returns:
         Any: Computed result."""
-    model_kwargs_override = model_kwargs_override or {}
-    config = load_config(config_path)
+    if model_type in {"mel_band_roformer", "mel_band_conformer"}:
+        model_kwargs_override = dict(model_kwargs_override or {})
+        model_kwargs_override.setdefault("zero_dc", False)
+        if model_type == "mel_band_roformer":
+            config = load_config(config_path)
+            if "use_shared_bias" in config.model or "use_shared_bias" in model_kwargs_override:
+                # The deployed MelBand constructor accepted but ignored this
+                # field. Keep that compatibility outside the upstream core.
+                from pymss_core.modules.bs_roformer import MelBandRoformer
 
-    if model_type == "mdx23c":
-        from .modules.mdx23c_tfc_tdf_v3 import TFC_TDF_net
-
-        return TFC_TDF_net(config), config
-    elif model_type == "htdemucs":
-        from .modules.demucs4ht import get_model
-
-        return get_model(config), config
-    elif model_type == "mel_band_roformer":
-        from .modules.bs_roformer import MelBandRoformer
-
-        model_kwargs = dict(config.model)
-        model_kwargs.update(model_kwargs_override)
-        return MelBandRoformer(**model_kwargs), config
-    elif model_type == "bs_roformer":
-        from .modules.bs_roformer import BSRoformer
-
-        return BSRoformer(**dict(config.model)), config
-    elif model_type == "bs_roformer_hyperace":
-        from .modules.bs_roformer import BSRoformerHyperACE
-
-        return BSRoformerHyperACE(**dict(config.model)), config
-    elif model_type == "bandit":
-        from .modules.bandit.core.model import MultiMaskMultiSourceBandSplitRNNSimple
-
-        return MultiMaskMultiSourceBandSplitRNNSimple(**config.model), config
-    elif model_type == "bandit_v2":
+                kwargs = {**config.model, **model_kwargs_override}
+                kwargs.pop("use_shared_bias", None)
+                return MelBandRoformer(**kwargs), config
+        return _core_get_model_from_config(
+            model_type, config_path, model_kwargs_override=model_kwargs_override
+        )
+    if model_type == "bandit_v2":
+        config = load_config(config_path)
         from .modules.bandit_v2.bandit import Bandit
 
         return Bandit(**config.kwargs), config
-    elif model_type == "scnet":
-        from .modules.scnet import SCNet
-
-        return SCNet(**config.model), config
-    elif model_type == "apollo":
-        from .modules.look2hear.apollo import Apollo
-
-        return Apollo(**config.model), config
-    elif model_type == "vr":
-        raise ValueError("VR models are loaded directly by MSSeparator and do not use YAML config loading")
-    raise ValueError(f"Model type {model_type} not supported")
+    return _core_get_model_from_config(model_type, config_path, model_kwargs_override=model_kwargs_override)
 
 
 def clear_mlx_cache():
@@ -232,6 +202,7 @@ def _get_inference_step(config, chunk_size):
 
     Returns:
         Any: Computed result."""
+    apply_msst_inference_compat(config)
     overlap_size = int(config.inference.get("overlap_size", chunk_size // 2))
     if overlap_size < 0 or overlap_size >= chunk_size:
         raise ValueError("inference.overlap_size must be >= 0 and < audio.chunk_size")
@@ -347,6 +318,14 @@ def _autocast(device, enabled):
     if enabled and device_type in ("cuda", "mps"):
         return torch.amp.autocast(device_type, dtype=torch.float16)
     return nullcontext()
+
+
+def _resolve_use_amp(config):
+    """Resolve the effective AMP setting for PyTorch inference."""
+    use_amp = config.inference.get("use_amp")
+    if use_amp is not None:
+        return bool(use_amp)
+    return bool(config.training.get("use_amp", True))
 
 
 def _source_names(config):
@@ -468,7 +447,7 @@ def _model_source_context(model, source_indices):
 
     Returns:
         None: This callable completes for its side effects."""
-    target = model.module if isinstance(model, nn.DataParallel) else model
+    target = _model_target(model)
     sentinel = object()
     previous = getattr(target, "_pymss_source_indices", sentinel)
     if source_indices is not None:
@@ -510,7 +489,7 @@ def _run_model_chunk(model, arr, chunk_size, source_indices=None):
 
     Returns:
         Any: Computed result."""
-    target = model.module if isinstance(model, nn.DataParallel) else model
+    target = _model_target(model)
     chunks = _fit_tensor_length(_ensure_source_dim(model(arr), arr).float(), chunk_size)
     already_selected = (
         source_indices is not None and hasattr(target, "_active_source_indices") and chunks.shape[1] == len(source_indices)
@@ -833,7 +812,29 @@ def _mlx_fit_length(x, length):
     return x
 
 
-def _mlx_run_model_chunk(model, arr, chunk_size):
+@contextmanager
+def _mlx_clear_cache_after_eval(enabled=False):
+    """Clear MLX allocator cache after explicit eval points when requested."""
+    if not enabled:
+        yield
+        return
+    import mlx.core as mx
+
+    original_eval = mx.eval
+
+    def eval_and_clear(*args, **kwargs):
+        result = original_eval(*args, **kwargs)
+        clear_mlx_cache()
+        return result
+
+    mx.eval = eval_and_clear
+    try:
+        yield
+    finally:
+        mx.eval = original_eval
+
+
+def _mlx_run_model_chunk(model, arr, chunk_size, clear_cache_after_eval=False):
     """Implement the mlx run model chunk helper.
 
     Args:
@@ -843,7 +844,8 @@ def _mlx_run_model_chunk(model, arr, chunk_size):
 
     Returns:
         Any: Computed result."""
-    y = model.mlx_forward_mx(arr)
+    with _mlx_clear_cache_after_eval(clear_cache_after_eval):
+        y = model.mlx_forward_mx(arr)
     if y.ndim == arr.ndim:
         y = y[:, None]
     return _mlx_fit_length(y, chunk_size)
@@ -942,6 +944,7 @@ def demix_track_mlx_full(config, model, mix, device, pbar=False, source_indices=
     import mlx.core as mx
 
     C = config.audio.chunk_size
+    sample_rate = int(config.audio.get("sample_rate", 44100))
     source_indices = _normalize_source_indices(config, source_indices)
     step = _get_inference_step(config, C)
     border = C - step
@@ -952,13 +955,18 @@ def demix_track_mlx_full(config, model, mix, device, pbar=False, source_indices=
     starts, windows = _mlx_build_chunk_plan(mix.shape[1], C, step, fade_size)
     result = mx.zeros((_source_count(config, source_indices), mix.shape[0], mix.shape[1]), dtype=mx.float32)
     counter = mx.zeros((1, 1, mix.shape[1]), dtype=mx.float32)
-    progress = _ProgressContext(pbar, mix.shape[1], progress_callback)
+    progress = _ProgressContext(pbar, mix.shape[1], progress_callback, sample_rate=sample_rate)
 
     for batch_start in range(0, len(starts), batch_size):
         batch_indices = range(batch_start, min(batch_start + batch_size, len(starts)))
         batch = [(_mlx_extract_chunk(mix, starts[idx], C), idx) for idx in batch_indices]
         batch_count = len(batch)
-        chunks = _mlx_run_model_chunk(model, mx.stack([chunk for (chunk, _), _ in batch], axis=0), C)
+        chunks = _mlx_run_model_chunk(
+            model,
+            mx.stack([chunk for (chunk, _), _ in batch], axis=0),
+            C,
+            clear_cache_after_eval=bool(config.inference.get("mps_mlx_clear_cache", False)),
+        )
         chunks = _mlx_select_sources(chunks, source_indices)
         for j, ((_, length), idx) in enumerate(batch):
             result, counter = _mlx_add_weighted_chunk(result, counter, chunks[j], windows[idx], starts[idx], length)
@@ -994,6 +1002,7 @@ def demix_track(config, model, mix, device, pbar=False, source_indices=None, pro
     Returns:
         Any: Computed result."""
     C = config.audio.chunk_size
+    sample_rate = int(config.audio.get("sample_rate", 44100))
     source_indices = _normalize_source_indices(config, source_indices)
     step = _get_inference_step(config, C)
     border = C - step
@@ -1006,10 +1015,10 @@ def demix_track(config, model, mix, device, pbar=False, source_indices=None, pro
     use_complete_fast_path = device_type in ("cuda", "cpu")
     mix_device = _model_mix(mix, device)
 
-    with _autocast(device, config.training.get("use_amp", True)):
+    with _autocast(device, _resolve_use_amp(config)):
         with torch.inference_mode():
             result, counter = _init_overlap_buffers(config, mix, device, use_complete_fast_path, source_indices)
-            progress = _ProgressContext(pbar, mix.shape[1], progress_callback)
+            progress = _ProgressContext(pbar, mix.shape[1], progress_callback, sample_rate=sample_rate)
 
             with _model_source_context(model, source_indices):
                 complete_chunks = 0
@@ -1078,11 +1087,12 @@ def demix_track_demucs(config, model, mix, device, pbar=False, source_indices=No
     source_indices = _normalize_source_indices(config, source_indices)
     source_names = _source_names(config)
     S = len(source_names)
-    C = config.training.samplerate * config.training.segment
+    sample_rate = int(config.training.samplerate)
+    C = sample_rate * config.training.segment
     batch_size = config.inference.batch_size
     step = _get_inference_step(config, C)
 
-    with _autocast(device, config.training.get("use_amp", True)):
+    with _autocast(device, _resolve_use_amp(config)):
         with torch.inference_mode():
             req_shape = (_source_count(config, source_indices),) + tuple(mix.shape)
             result = torch.zeros(req_shape, dtype=torch.float32)
@@ -1090,7 +1100,7 @@ def demix_track_demucs(config, model, mix, device, pbar=False, source_indices=No
             i = 0
             batch_data = []
             batch_locations = []
-            progress = _ProgressContext(pbar, mix.shape[1], progress_callback)
+            progress = _ProgressContext(pbar, mix.shape[1], progress_callback, sample_rate=sample_rate)
 
             while i < mix.shape[1]:
                 part = mix[:, i : i + C].to(device)
@@ -1109,8 +1119,6 @@ def demix_track_demucs(config, model, mix, device, pbar=False, source_indices=No
                         counter[..., start : start + l] += 1.0
                     batch_data, batch_locations = [], []
 
-                if progress.bar:
-                    progress.bar.update(step)
                 progress.emit(min(i, mix.shape[1]))
 
             progress.close()
@@ -1149,9 +1157,15 @@ def demix(
     if model_type in {"demucs", "tasnet", "legacy_demucs", "legacy_tasnet"}:
         from .modules.legacy_demucs import apply_legacy_model
 
-        progress = _ProgressContext(callback=progress_callback)
+        sample_rate = int(config.training.samplerate)
+        progress = _ProgressContext(
+            callback=progress_callback,
+            total=mix.shape[1],
+            sample_rate=sample_rate,
+            message="Processing audio",
+        )
         progress.emit(0)
-        with _autocast(device, config.training.get("use_amp", True)):
+        with _autocast(device, _resolve_use_amp(config)):
             with torch.inference_mode():
                 estimates = (
                     apply_legacy_model(
@@ -1165,7 +1179,7 @@ def demix(
                     .cpu()
                     .numpy()
                 )
-        progress.emit(1)
+        progress.emit(mix.shape[1])
         return dict(zip(config.training.instruments, estimates))
     if model_type == "htdemucs":
         return demix_track_demucs(

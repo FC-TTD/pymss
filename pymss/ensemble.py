@@ -67,12 +67,8 @@ def absmax(a, *, axis):
 
     Returns:
         Any: Computed result."""
-    dims = list(a.shape)
-    dims.pop(axis)
-    indices = np.ogrid[tuple(slice(0, d) for d in dims)]
-    argmax = np.abs(a).argmax(axis=axis)
-    indices.insert((len(a.shape) + axis) % len(a.shape), argmax)
-    return a[tuple(indices)]
+    idxs = np.expand_dims(np.abs(a).argmax(axis=axis), axis)
+    return np.squeeze(np.take_along_axis(a, idxs, axis=axis), axis=axis)
 
 
 def lambda_min(arr, axis=None, key=None, keepdims=False):
@@ -322,3 +318,21 @@ def save_ensemble_audio(
     output_format = output_format or output_path.suffix.lstrip(".").lower() or "wav"
     save_audio(str(output_path), result, sample_rate, output_format, audio_params or {})
     return output_path
+
+
+# Register the waveform-combination capability (reuses average_waveforms, no
+# reimplementation). Lazy import avoids a circular dependency at module load.
+def _register_ensemble_capability() -> None:
+    from .plugins.registry import _REGISTRY
+
+    if "ensemble" in _REGISTRY.capabilities and _REGISTRY.capabilities["ensemble"].source == "builtin":
+        return
+    _REGISTRY.register_capability(
+        "ensemble",
+        average_waveforms,
+        source="builtin",
+        description="combine source waveforms (8 algorithms: avg/median/min/max x wave/fft)",
+    )
+
+
+_register_ensemble_capability()

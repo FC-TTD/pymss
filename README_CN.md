@@ -10,6 +10,22 @@
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
+### AMD ROCm
+
+```sh
+pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+pip install pymss
+```
+
+**Windows：** 原生支持自 ROCm 7.2.1 起（Adrenalin 26.2.2+ 驱动、Python 3.12）。直链安装 AMD 官方 wheel 后再装 pymss：
+
+```bat
+pip install --no-cache-dir https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl
+pip install pymss
+```
+
+WSL2（RDNA3/RDNA4）可改在 Ubuntu 子系统里按上面的 Linux 步骤安装。
+
 如果只需要 CLI 和 Python API，安装：
 
 ```sh
@@ -72,11 +88,13 @@ uv run pytest test -q
 pymss infer bs_roformer_voc_hyperacev2 \
   -i path/to/input_file_or_folder \
   -o results \
+  --save-as-folder \
   --device auto \
-  --format wav
+  --format wav     # wav | flac | mp3 | m4a | aac | opus | vorbis | ogg
 ```
 
 `--device auto` 在有 NVIDIA GPU 时优先使用 CUDA；Apple Silicon Mac 默认使用 MLX 后端。可以用 `--device mlx` 强制 MLX，或用 `--device mps` 强制 PyTorch MPS。
+`--save-as-folder` 会把每个输入音频的输出音轨保存到以该音频命名的子文件夹中，例如 `results/song/song_vocals.wav`。
 
 默认下载源是 ModelScope。也可以指定下载源或模型目录：
 
@@ -88,6 +106,34 @@ pymss --model-dir /path/to/models infer bs_roformer_voc_hyperacev2 \
 ```
 
 如果是在源码目录里未安装运行，可以用 `python -m pymss.cli` 代替 `pymss`。
+
+### CLI Workflow
+
+可以用 workflow 文件把多个模型串成自动流程：
+
+```sh
+pymss workflow init -o vocal_chain.yaml
+pymss workflow validate -c vocal_chain.yaml
+pymss workflow run -c vocal_chain.yaml \
+  -i path/to/input_file_or_folder \
+  -o results \
+  --download
+```
+
+workflow 中的 `input: input` 表示原始音频，`input: split.other` 表示使用 `split` 步骤输出的 `other` 音轨。文件夹输入会按 step/model 批处理：第 1 个 step 会先跑完所有输入，再加载第 2 个 step。`save` 控制保存哪些音轨以及保存到输出目录下的哪个子目录。默认批量输出会按 `results/song/vocal/song_vocals.wav` 分到每个音频的子目录；加 `--output-layout flat` 后会输出为 `results/vocal/song_vocals.wav`。同一批里输入 stem 重名时会自动加后缀，例如 `song_3_vocals.wav`。共享推理参数如 `batch_size` 可以放在 `defaults.inference_params`，每个模型单独的参数如各自的 `overlap_size` 可以放在该 step 的 `inference_params`。
+
+### CLI Comfy（comfy-mss JSON 工作流）
+
+直接运行原生 comfy-mss JSON 工作流，无需 ComfyUI 运行时。图引擎会解析 JSON、解析节点连线，并在 pymss 自己的 `MSSeparator` 和能力池之上执行节点：
+
+```sh
+pymss comfy run -c workflow.json \
+  -i input.wav \
+  -o results \
+  --download
+```
+
+所有 comfy-mss 节点（`pymss_load_audio`、`pymss_mss_separate`、`pymss_audio_ensemble`、`pymss_save_audio` 等）和 ComfyUI 核心音频节点（`SaveAudio`/`SaveAudioMP3`/`SaveAudioOpus`/`SaveAudioAdvanced`、`AudioMerge`、`AudioConcat`、`TrimAudioDuration`、`SplitAudioChannels`/`JoinAudioChannels`、`AudioAdjustVolume`、`EmptyAudio`、`AudioEqualizer3Band`、`PreviewAudio`、`LoadAudio`）都已支持。节点执行器消费内置能力而不是重写 DSP，因此同一套 `eq`/`mix`/`ensemble`/`{fmt}_encode` 能力同时支撑 CLI、Python API 和工作流节点。加 `--no-strict` 可以在遇到未知节点时警告并跳过，而不是报错。
 
 ### CLI Ensemble
 
@@ -111,6 +157,56 @@ pymss serve --webui
 
 详细用法见 [server CLI 文档](./docs/server/cli.md)、[server API 文档](./docs/server/api.md) 和 [server 错误文档](./docs/server/errors.md)。
 
+### 插件系统
+
+pymss 有插件系统，用于扩展能力——音频 DSP 操作、音频编解码器、以及工作流节点。内置功能（23 个能力：15 个 DSP/声道操作 + 8 个编解码器）和插件用的是同一套注册机制，核心与扩展共用同一个能力池。
+
+**安装插件** —— 可用官方目录名、git URL 或本地路径。在 URL 后加 `#子目录` 可从 monorepo 子目录安装；用 `@tag` 锁定版本：
+
+```sh
+pymss install loudnorm                                   # 按官方目录名
+pymss install "https://github.com/xxx/repo#plugins/eq"   # URL + 子目录
+pymss install https://github.com/xxx/repo --subpath plugins/eq
+pymss install ./my-local-plugin
+pymss install loudnorm@v0.2.0                            # 锁定 git tag/branch/commit
+```
+
+插件的依赖（在其 `pyproject.toml` 里声明）会**自动安装**到当前环境——venv 由 uv 管理时用 uv，否则用 pip。加 `--no-deps` 可跳过。
+
+**管理插件：**
+
+```sh
+pymss plugins list           # 已装插件：版本、来源、加载状态
+pymss plugins available      # 浏览官方插件目录
+pymss plugins search loudness   # 按名称/描述/标签搜索目录
+pymss plugins update loudnorm   # 重装为最新版本
+pymss uninstall loudnorm
+pymss plugins dir            # 打印插件目录
+```
+
+`update` 对**官方插件和第三方（URL/路径装的）插件完全一样**——pymss 会记录每次安装的来源，所以更新时只需用插件文件夹名。
+
+插件放在 `~/.pymss/plugins/`（可用 `PYMSS_PLUGINS_DIR` 覆盖）。单个插件加载失败不会影响其他插件。官方插件目录是一个独立的 `pymss-plugins` 仓库（里面的 `registry.json` 映射短名到来源）；可通过 `PYMSS_PLUGINS_REGISTRY` 指向自定义目录。
+
+**编写插件** —— 只需标准的 `pyproject.toml`（带 `[project].name`/`version`/`dependencies`），无需任何 pymss 专属字段。注册一个能力，pymss 会让它对 Python API、CLI 和工作流节点都可用：
+
+```python
+from pymss.plugins import register_capability, register_node, register_cli
+
+@register_capability("myplugin_denoise")
+def denoise(audio, sample_rate, strength=0.5):
+    ...                          # 输入输出都是 numpy 音频数组
+
+@register_node("MyDenoiseNode")  # 消费该能力的工作流节点
+def denoise_node(ctx, inputs):
+    fn = ctx.require("myplugin_denoise")
+    ...
+```
+
+能力是注册在扁平全局池里的具名函数；节点/CLI/库调用都按名字查找。提供者和消费者可以分别打包，仅通过能力名耦合——例如适配 `SaveAudioOpus` 节点时，可以直接复用已有的 `opus_encode` 能力，而不是重写编码器。
+
+内置能力包括：`to_mono`、`split_channels`、`join_channels`、`adjust_volume`、`invert_phase`、`normalize_peak`、`standardize`/`destandardize`、`trim`、`concat`、`mix`、`empty_audio`、`eq`、`resample`、`ensemble`，以及 `{wav,flac,mp3,m4a,aac,opus,vorbis,ogg}_encode`。
+
 ### Python API
 
 直接用 catalog 里的模型名即可，不需要传 `model_type`、`model_path`、`config_path`。
@@ -126,6 +222,7 @@ separator = MSSeparator.from_model_name(
     store_dirs="results",
 )
 separator.process_folder("path/to/input_file_or_folder")
+separator.close()
 ```
 
 `download=True` 会在加载前下载缺失的模型文件；如果只想使用本地已有模型，可以省略它。
@@ -164,6 +261,7 @@ separator = MSSeparator(
         "vocals": "./output/vocals",
         "other": None # None 或缺少此音轨将导致不输出此音轨的文件。 此示例将在 ./output/vocals 中输出人声音轨，并忽略其他（乐器）音轨。 确保键与配置文件匹配。
     },
+    save_as_folder=False,
     audio_params={"wav_bit_depth": "FLOAT", "flac_bit_depth": "PCM_24", "mp3_bit_rate": "320k", "m4a_bit_rate": "192k", "m4a_aac_at_quality": 2}, # 可以省略
     logger=get_separation_logger(), # 可以省略
     debug=False, # 可以省略
@@ -175,8 +273,8 @@ separator = MSSeparator(
         "normalize": False
     } # 可以省略
 )
-# 处理文件夹中的所有音频文件
-separator.process_folder('path/to/input_folder')
+with separator as s:
+    s.process_folder('path/to/input_file_or_folder')
 ```
 ### 手动构造参数
 
@@ -184,7 +282,9 @@ separator.process_folder('path/to/input_folder')
 
 - model_type: 模型类型，例如 'htdemucs'。 必须是以下之一
     ['bs_roformer',
+    'bs_conformer',
     'mel_band_roformer',
+    'mel_band_conformer',
     'htdemucs',
     'mdx23c',
     'bandit',
@@ -196,9 +296,10 @@ separator.process_folder('path/to/input_folder')
 - config_path: 配置文件路径。
 - device: 设备类型，默认为 'auto'。 必须是以下之一 ['auto', 'cuda', 'mps', 'cpu']
 - device_ids: 设备 ID 列表，默认为 [0]。
-- output_format: 输出音频格式，默认为 'wav'。 必须是以下之一 ['wav', 'flac', 'mp3', 'm4a']
+- output_format: 输出音频格式，默认为 'wav'。可选 wav、flac、mp3、m4a、aac、opus、vorbis、ogg。
 - use_tta: 是否使用 TTA（测试时增强），默认为 False。 使用 TTA 会使处理时间增加三倍，但质量会略有提高。
 - store_dirs: 存储目录，可以是单个文件夹路径或带有乐器键的字典。
+- save_as_folder: 为 True 且 store_dirs 指向同一个输出文件夹时，会把每个输入音频的输出音轨保存到以音频名命名的子文件夹中。
 - audio_params: 音频参数，包括 wav_bit_depth、flac_bit_depth、mp3_bit_rate、m4a_bit_rate 和 m4a_aac_at_quality。 默认为 {"wav_bit_depth": "FLOAT", "flac_bit_depth": "PCM_24", "mp3_bit_rate": "320k", "m4a_bit_rate": "192k", "m4a_aac_at_quality": 2}。
 - logger: Logger 实例。 默认为 pymss.get_separation_logger()
 - debug: 是否启用调试模式，默认为 False。
@@ -206,7 +307,7 @@ separator.process_folder('path/to/input_folder')
 
 ### CUDA Attention 后端
 
-RoFormer 系列模型在已安装 PyTorch 暴露 cuDNN attention 时默认使用 cuDNN attention，否则使用 PyTorch 默认 SDPA 路径。需要探测式回退时可通过 `inference_params={"cuda_attention_backend": "auto"}` 覆盖。可选值为 `auto`、`default`、`flash`、`cudnn`、`efficient`、`math` 和 `xformers`。`auto` 会优先尝试 cuDNN attention，然后回退到 PyTorch memory-efficient SDPA，再回退到 PyTorch 默认 SDPA。`xformers` 是本地可选安装项，不作为必需依赖。
+RoFormer 系列模型在已安装 PyTorch 暴露 cuDNN attention 时默认使用 cuDNN attention，在 ROCm/HIP 上默认使用 memory-efficient SDPA 后端（AOTriton），否则使用 PyTorch 默认 SDPA 路径。需要探测式回退时可通过 `inference_params={"cuda_attention_backend": "auto"}` 覆盖。可选值为 `auto`、`default`、`flash`、`cudnn`、`efficient`、`math` 和 `xformers`。`auto` 会优先尝试 cuDNN attention，然后回退到 PyTorch memory-efficient SDPA，再回退到 PyTorch 默认 SDPA。`xformers` 是本地可选安装项，不作为必需依赖。
 
 ### Apple Silicon MLX 后端
 
@@ -255,11 +356,18 @@ separator = MSSeparator.from_model_name(
         "aggression": 5,
     },
 )
-separator.process_folder("path/to/input_folder")
+with separator as s:
+    s.process_folder("path/to/input_file_or_folder")
 ```
 
 ### Hugging Face 配置提醒
-一些从 Hugging Face 或 MSST-WebUI 下载的模型配置使用 `inference.num_overlap`。当前优化后的 pymss 路径使用 `inference.overlap_size`。如果配置里只有 `num_overlap`，请手动添加 `overlap_size`，或通过 `inference_params` 传入；否则 pymss 会回退到 50% overlap，推理会慢很多。
+一些从 Hugging Face 或 MSST-WebUI 下载的模型配置使用 `inference.num_overlap`。当前优化后的 pymss 路径使用 `inference.overlap_size`。若配置里只有 `num_overlap`，pymss 会自动换算：
+
+```text
+overlap_size = chunk_size - chunk_size // num_overlap
+```
+
+例如 `num_overlap: 2` 对应 50% overlap（与 MSST 一致，但更慢）。想加快推理请显式写更小的 `overlap_size`，或通过 `inference_params` 传入。
 
 推荐快速设置：
 

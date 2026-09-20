@@ -11,6 +11,23 @@ If you want the CUDA build of PyTorch, install it first:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
+### AMD ROCm
+
+
+```sh
+pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+pip install pymss
+```
+
+**Windows:** native support starts with ROCm 7.2.1 (Adrenalin 26.2.2+ driver, Python 3.12). Install the AMD wheels by direct URL, then pymss:
+
+```bat
+pip install --no-cache-dir https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl
+pip install pymss
+```
+
+WSL2 (RDNA3/RDNA4) can follow the Linux steps instead.
+
 For CLI and Python API usage, install:
 
 ```sh
@@ -73,11 +90,13 @@ Run inference by catalog model name. If the model, config, or auxiliary files ar
 pymss infer bs_roformer_voc_hyperacev2 \
   -i path/to/input_file_or_folder \
   -o results \
+  --save-as-folder \
   --device auto \
-  --format wav
+  --format wav     # wav | flac | mp3 | m4a | aac | opus | vorbis | ogg
 ```
 
 `--device auto` uses CUDA first when an NVIDIA GPU is available. On Apple Silicon it uses the MLX backend by default. Use `--device mlx` to force MLX, or `--device mps` to force PyTorch MPS.
+`--save-as-folder` writes each input audio file's stems under a subfolder named after that audio file, for example `results/song/song_vocals.wav`.
 
 The default download source is ModelScope. You can choose another source or model directory:
 
@@ -89,6 +108,34 @@ pymss --model-dir /path/to/models infer bs_roformer_voc_hyperacev2 \
 ```
 
 When running from a source checkout without installation, use `python -m pymss.cli` instead of `pymss`.
+
+### CLI workflow
+
+Use a workflow file to chain multiple models automatically:
+
+```sh
+pymss workflow init -o vocal_chain.yaml
+pymss workflow validate -c vocal_chain.yaml
+pymss workflow run -c vocal_chain.yaml \
+  -i path/to/input_file_or_folder \
+  -o results \
+  --download
+```
+
+In a workflow, `input: input` means the original audio, and `input: split.other` means the `other` stem produced by the `split` step. For folder inputs, workflow inference batches by step/model: step 1 runs for every input before step 2 is loaded. `save` controls which stems are written and which output subdirectory they use. By default, workflow batch outputs are grouped as `results/song/vocal/song_vocals.wav`; pass `--output-layout flat` to write them as `results/vocal/song_vocals.wav` instead. Duplicate input stems in the same batch are disambiguated with suffixes such as `song_3_vocals.wav`. Put shared inference options such as `batch_size` under `defaults.inference_params`, and put model-specific options such as each step's `overlap_size` under that step's `inference_params`.
+
+### CLI comfy (comfy-mss JSON workflows)
+
+Run native comfy-mss JSON workflows directly — no ComfyUI runtime required. The graph engine parses the JSON, resolves node links, and executes nodes on top of pymss's own `MSSeparator` and the capability pool:
+
+```sh
+pymss comfy run -c workflow.json \
+  -i input.wav \
+  -o results \
+  --download
+```
+
+All comfy-mss nodes (`pymss_load_audio`, `pymss_mss_separate`, `pymss_audio_ensemble`, `pymss_save_audio`, ...) and ComfyUI core audio nodes (`SaveAudio`/`SaveAudioMP3`/`SaveAudioOpus`/`SaveAudioAdvanced`, `AudioMerge`, `AudioConcat`, `TrimAudioDuration`, `SplitAudioChannels`/`JoinAudioChannels`, `AudioAdjustVolume`, `EmptyAudio`, `AudioEqualizer3Band`, `PreviewAudio`, `LoadAudio`) are supported. Node executors consume built-in capabilities rather than reimplementing DSP, so the same `eq` / `mix` / `ensemble` / `{fmt}_encode` capabilities back the CLI, the Python API, and the workflow nodes. Pass `--no-strict` to skip unknown node types with a warning instead of failing.
 
 ### CLI ensemble
 
@@ -112,6 +159,56 @@ pymss serve --webui
 
 See [server CLI docs](./docs/server/cli.md), [server API docs](./docs/server/api.md), and [server error docs](./docs/server/errors.md) for details.
 
+### Plugin system
+
+pymss has a plugin system for extending capabilities — audio DSP operations, audio codecs, and workflow nodes. Built-in functionality (23 capabilities: 15 DSP/channel ops + 8 codecs) is registered through the same mechanism plugins use, so core and extensions share one pool.
+
+**Install a plugin** — by official registry name, git URL, or local path. Append `#subdir` to install from a monorepo subdirectory; pin a version with `@tag`:
+
+```sh
+pymss install loudnorm                                   # by official registry name
+pymss install "https://github.com/xxx/repo#plugins/eq"   # URL + subdirectory
+pymss install https://github.com/xxx/repo --subpath plugins/eq
+pymss install ./my-local-plugin
+pymss install loudnorm@v0.2.0                            # pin a git tag/branch/commit
+```
+
+Plugin dependencies (declared in its `pyproject.toml`) are **installed automatically** into the current environment — uv is used when the venv is uv-managed, pip otherwise. Pass `--no-deps` to skip.
+
+**Manage plugins:**
+
+```sh
+pymss plugins list           # installed plugins: version, source, load status
+pymss plugins available      # browse the official registry
+pymss plugins search loudness   # search the registry by name/description/tag
+pymss plugins update loudnorm   # reinstall a plugin at its latest version
+pymss uninstall loudnorm
+pymss plugins dir            # print the plugins directory
+```
+
+`update` works identically for **official and third-party (URL/path-installed) plugins** — pymss records each install's provenance, so you only ever refer to a plugin by its folder name.
+
+Plugins live in `~/.pymss/plugins/` (override with `PYMSS_PLUGINS_DIR`). A single plugin failing to load never blocks others. The official plugin registry is a separate `pymss-plugins` repo (a `registry.json` mapping short names to sources) — point `pymss install <name>` at a custom one via `PYMSS_PLUGINS_REGISTRY`.
+
+**Write a plugin** — a standard `pyproject.toml` with `[project].name`/`version`/`dependencies` is all pymss needs (no pymss-specific fields). Register a capability and pymss makes it available to the Python API, the CLI, and workflow nodes:
+
+```python
+from pymss.plugins import register_capability, register_node, register_cli
+
+@register_capability("myplugin_denoise")
+def denoise(audio, sample_rate, strength=0.5):
+    ...                          # any numpy audio in/out
+
+@register_node("MyDenoiseNode")  # workflow node consuming the capability
+def denoise_node(ctx, inputs):
+    fn = ctx.require("myplugin_denoise")
+    ...
+```
+
+A capability is a named function in a flat global pool; nodes/CLI/library calls look it up by name. Providers and consumers can ship in different packages, coupled only by the capability name — so someone adapting `SaveAudioOpus` reuses the `opus_encode` capability instead of rewriting the encoder.
+
+Built-in capabilities include: `to_mono`, `split_channels`, `join_channels`, `adjust_volume`, `invert_phase`, `normalize_peak`, `standardize`/`destandardize`, `trim`, `concat`, `mix`, `empty_audio`, `eq`, `resample`, `ensemble`, and `{wav,flac,mp3,m4a,aac,opus,vorbis,ogg}_encode`.
+
 ### Python API
 
 Use a catalog model name directly. You do not need to pass `model_type`, `model_path`, or `config_path`.
@@ -127,6 +224,7 @@ separator = MSSeparator.from_model_name(
     store_dirs="results",
 )
 separator.process_folder("path/to/input_file_or_folder")
+separator.close()
 ```
 
 `download=True` downloads missing model files before loading. Omit it for strict local-only loading.
@@ -144,6 +242,30 @@ with MSSeparator.from_model_name(
     store_dirs="results",
 ) as separator:
     separator.process_folder("path/to/input_file_or_folder")
+```
+
+### Register custom models
+
+Register local weights + config once, then reuse the name like a catalog model (`~/.cache/pymss/user_models.json`, override with `PYMSS_USER_MODELS`):
+
+```sh
+pymss register my_bs --type bs_conformer --model /path/model.ckpt --config /path/config.yaml --overlap-size 44100
+pymss infer my_bs -i song.wav -o results
+pymss list --user-only
+pymss unregister my_bs
+```
+
+```python
+from pymss import register_model, MSSeparator
+
+register_model(
+    "my_bs",
+    "bs_conformer",
+    "/path/model.ckpt",
+    "/path/config.yaml",
+    overlap_size=44100,
+)
+separator = MSSeparator.from_model_name("my_bs")
 ```
 
 ### Manual model paths
@@ -166,6 +288,7 @@ separator = MSSeparator(
         "vocals": "./output/vocals",
         "other": None # None or missing this stem will result in no output file for this stem. This example will output the vocal's stem in ./output/vocals and ignoring the other(instrumental) stem. Making sure the key(s) match the config file.
     },
+    save_as_folder=False,
     audio_params={"wav_bit_depth": "FLOAT", "flac_bit_depth": "PCM_24", "mp3_bit_rate": "320k", "m4a_bit_rate": "192k", "m4a_aac_at_quality": 2}, # Can be omitted
     logger=get_separation_logger(), # Can be omitted
     debug=False, # Can be omitted
@@ -177,9 +300,8 @@ separator = MSSeparator(
         "normalize": False
     } # Can be omitted
 )
-
-# process all audio files in the folder
-separator.process_folder('path/to/input_folder')
+with separator as s:
+    s.process_folder('path/to/input_file_or_folder')
 ```
 
 ### Manual Constructor Parameters
@@ -188,7 +310,9 @@ For a detailed explanation of every `MSSeparator` argument, see the [MSSeparator
 
 - model_type: The type of model, e.g., 'htdemucs'. Must be one of 
     ['bs_roformer', 
+    'bs_conformer',
     'mel_band_roformer', 
+    'mel_band_conformer',
     'htdemucs', 
     'mdx23c', 
     'bandit', 
@@ -200,9 +324,10 @@ For a detailed explanation of every `MSSeparator` argument, see the [MSSeparator
 - config_path: The path to the configuration file.
 - device: The type of device, default is 'auto'. Must be one of ['auto', 'cuda', 'mps', 'cpu']
 - device_ids: List of device IDs, default is [0].
-- output_format: The output audio format, default is 'wav'. Must be one of ['wav', 'flac', 'mp3', 'm4a']
+- output_format: The output audio format, default is 'wav'. One of wav, flac, mp3, m4a, aac, opus, vorbis, ogg.
 - use_tta: Whether to use TTA, default is False. Using TTA will triple the processing time with a little bit improvement in quality.
 - store_dirs: Storage directories, can be a single folder path or a dictionary with instrument keys.
+- save_as_folder: When True and store_dirs points to one output folder, save each input audio file's stems in a subfolder named after the audio file.
 - audio_params: Audio parameters including wav_bit_depth, flac_bit_depth, mp3_bit_rate, m4a_bit_rate, and m4a_aac_at_quality. Default is {"wav_bit_depth": "FLOAT", "flac_bit_depth": "PCM_24", "mp3_bit_rate": "320k", "m4a_bit_rate": "192k", "m4a_aac_at_quality": 2}.
 - logger: Logger instance. Default is pymss.get_separation_logger()
 - debug: Whether to enable debug mode, default is False.
@@ -210,7 +335,7 @@ For a detailed explanation of every `MSSeparator` argument, see the [MSSeparator
 
 ### CUDA Attention Backend
 
-RoFormer-family models default to cuDNN attention on CUDA when the installed PyTorch build exposes it, otherwise they use PyTorch's default SDPA path. Override with `inference_params={"cuda_attention_backend": "auto"}` if you want fallback probing. Valid values are `auto`, `default`, `flash`, `cudnn`, `efficient`, `math`, and `xformers`. `auto` tries cuDNN attention first, then PyTorch memory-efficient SDPA, then PyTorch default SDPA. `xformers` is optional and only used if installed locally; it is not a required dependency.
+RoFormer-family models default to cuDNN attention on CUDA when the installed PyTorch build exposes it, and to the memory-efficient SDPA backend (AOTriton) on ROCm/HIP; otherwise they use PyTorch's default SDPA path. Override with `inference_params={"cuda_attention_backend": "auto"}` if you want fallback probing. Valid values are `auto`, `default`, `flash`, `cudnn`, `efficient`, `math`, and `xformers`. `auto` tries cuDNN attention first, then PyTorch memory-efficient SDPA, then PyTorch default SDPA. `xformers` is optional and only used if installed locally; it is not a required dependency.
 
 ### Apple Silicon MLX Backend
 
@@ -259,12 +384,19 @@ separator = MSSeparator.from_model_name(
         "aggression": 5,
     },
 )
-separator.process_folder("path/to/input_folder")
+with separator as s:
+    s.process_folder("path/to/input_file_or_folder")
 ```
 
 ### Hugging Face Configs
 
-Some model configs downloaded from Hugging Face or MSST-WebUI use `inference.num_overlap`. This optimized pymss path uses `inference.overlap_size` instead. If the config only has `num_overlap`, add an explicit `overlap_size` or pass it through `inference_params`; otherwise pymss falls back to 50% overlap and inference will be much slower.
+Some model configs downloaded from Hugging Face or MSST-WebUI use `inference.num_overlap`. This optimized pymss path uses `inference.overlap_size` instead. When a config only has `num_overlap`, pymss now converts it automatically:
+
+```text
+overlap_size = chunk_size - chunk_size // num_overlap
+```
+
+For `num_overlap: 2` that is 50% overlap (correct MSST match, but slower). Prefer an explicit smaller `overlap_size` for speed, or pass it through `inference_params`.
 
 Recommended fast setting:
 

@@ -34,13 +34,22 @@ def selected_metadata(spec):
     entry = resolved["entry"]
     config_path = resolved.get("config_path")
     config = _preload_config(resolved) if config_path and Path(config_path).is_file() else None
-    if config is not None:
+    if resolved["model_type"] == "vr":
+        from pymss.modules.vocal_remover.vr_models import get_vr_model_metadata
+
+        native = get_vr_model_metadata(resolved["model_path"])
+        instruments = (native["primary_stem"], native["secondary_stem"])
+        sample_rate = 44100  # MSSeparator's native VR input rate.
+        validate_inference_params(spec["inference_params"], None, "vr")
+    elif config is not None:
         validate_inference_params(spec["inference_params"], config, resolved["model_type"])
         instruments = tuple(str(item) for item in config.training.instruments)
         sample_rate = int(config.audio.get("sample_rate", 44100))
     else:
         # Catalog is CPU-only. Actual native metadata replaces this upon load.
-        instruments = tuple(item for item in entry.config_instruments.split("|") if item)
+        # 2.1.x catalogs no longer contain config_instruments. A category's
+        # target_stem is not the model's complete output schema; do not guess it.
+        instruments = ()
         sample_rate = 44100
     return LoadedModel(
         separator=None, entry=entry, resolved=resolved,

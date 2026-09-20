@@ -76,6 +76,9 @@ class FakeRuntime:
     def _nested(self):
         return False
 
+    def pending_work(self):
+        return 0
+
     def get(self):
         assert _owned.get()
         return self.engine
@@ -199,6 +202,15 @@ class ManagedHTTPTests(unittest.IsolatedAsyncioTestCase):
         audio = sf.info(io.BytesIO(base64.b64decode(encoded["data"])))
         self.assertEqual((audio.samplerate, audio.subtype, audio.channels),
                          (48000, "PCM_24", 2))
+
+    async def test_missing_config_requests_explicit_load_without_gpu_work(self):
+        self.state.loaded.instruments = ()
+        status, body = await self.separate()
+        self.assertEqual(status, 503)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["code"], "model_not_loaded")
+        self.assertIn("/v1/models/load", error["message"])
+        self.assertEqual(self.runtime.engine.calls, [])
 
     async def test_native_limit_rejects_second_request_without_new_activity(self):
         self.runtime.engine.release = threading.Event()
