@@ -16,6 +16,24 @@ import threading
 from typing import Any, Callable, Iterator, Mapping
 
 
+@dataclass
+class SharedModel:
+    """Resident model wrapper shared by native and provider callers.
+
+    ``metadata`` is optional because a provider-only load does not need the
+    native server metadata. The native adapter can derive it from the selected
+    model spec when it joins an existing provider residency.
+    """
+
+    separator: Any
+    metadata: dict[str, Any] | None = None
+
+    def close(self) -> None:
+        close = getattr(self.separator, "close", None)
+        if callable(close):
+            close()
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(k): _jsonable(v) for k, v in value.items()}
@@ -162,23 +180,36 @@ class ModelCoordinator:
     def _key(self, kwargs: Mapping[str, Any]) -> str:
         return hashlib.sha256(json.dumps(_jsonable(kwargs), sort_keys=True, default=str).encode()).hexdigest()
 
+    @staticmethod
+    def key_for(kwargs: Mapping[str, Any]) -> str:
+        """Return a stable residency key for a model description."""
+        return hashlib.sha256(json.dumps(_jsonable(kwargs), sort_keys=True, default=str).encode()).hexdigest()
+
     @contextmanager
-    def lease(self, *, max_concurrency: int = 1, **kwargs: Any) -> Iterator[Any]:
-        key = self._key(kwargs)
+    def lease(
+        self,
+        *,
+        max_concurrency: int = 1,
+        residency_key: str | None = None,
+        factory: Callable[..., Any] | None = None,
+        replace: bool = False,
+        **kwargs: Any,
+    ) -> Iterator[Any]:
+        key = residency_key or self._key(kwargs)
         with self._condition:
             while True:
                 if self._closed:
                     raise RuntimeError("model coordinator is closed")
-                if self._resident_key == key and not self._switching and self._active < self._capacity:
+                if self._resident_key == key and not replace and not self._switching and self._active < self._capacity:
                     self._active += 1
                     break
                 if self._resident_key is None and not self._switching:
-                    self._resident = self._factory(**kwargs)
+                    self._resident = (factory or self._factory)(**kwargs)
                     self._resident_key = key
                     self._capacity = max(1, int(max_concurrency))
                     self._active = 1
                     break
-                if self._resident_key != key and self._active == 0 and not self._switching:
+                if (self._resident_key != key or replace) and self._active == 0 and not self._switching:
                     self._switching = True
                     old = self._resident
                     self._resident = None
@@ -186,7 +217,7 @@ class ModelCoordinator:
                     try:
                         if old is not None:
                             self._close(old)
-                        self._resident = self._factory(**kwargs)
+                        self._resident = (factory or self._factory)(**kwargs)
                         self._resident_key = key
                         self._capacity = max(1, int(max_concurrency))
                         self._active = 1
@@ -217,3 +248,79 @@ class ModelCoordinator:
             if resident is not None:
                 self._close(resident)
             self._condition.notify_all()
+
+
+class CoordinatedSeparator:
+    """Lazy separator facade backed by a shared :class:`ModelCoordinator`.
+
+    DAG execution asks the facade for model metadata and then calls
+    ``separate``. Each call acquires a coordinator lease, so a cached facade
+    never owns a second hidden model and the lease covers the complete native
+    invocation.
+    """
+
+    def __init__(
+        self,
+        coordinator: ModelCoordinator,
+        factory: Callable[..., Any],
+        kwargs: Mapping[str, Any],
+        *,
+        max_concurrency: int = 1,
+        residency_key: str | None = None,
+    ) -> None:
+        object.__setattr__(self, "_coordinator", coordinator)
+        object.__setattr__(self, "_factory", factory)
+        object.__setattr__(self, "_kwargs", dict(kwargs))
+        object.__setattr__(self, "_max_concurrency", max(1, int(max_concurrency)))
+        object.__setattr__(
+            self,
+            "_residency_key",
+            residency_key or ModelCoordinator.key_for(dict(kwargs)),
+        )
+        object.__setattr__(self, "_progress_callback", None)
+
+    def _target(self, resident: Any) -> Any:
+        return getattr(resident, "separator", resident)
+
+    @contextmanager
+    def _lease(self) -> Iterator[Any]:
+        with self._coordinator.lease(
+            max_concurrency=self._max_concurrency,
+            residency_key=self._residency_key,
+            factory=self._factory,
+            **self._kwargs,
+        ) as resident:
+            yield self._target(resident)
+
+    def separate(self, *args: Any, **kwargs: Any) -> Any:
+        with self._lease() as separator:
+            callback = self._progress_callback
+            if callback is not None:
+                try:
+                    separator.progress_callback = callback
+                except Exception:
+                    pass
+            return separator.separate(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        with self._lease() as separator:
+            return getattr(separator, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "progress_callback":
+            object.__setattr__(self, "_progress_callback", value)
+            return
+        object.__setattr__(self, name, value)
+
+    def __enter__(self) -> "CoordinatedSeparator":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        # The coordinator owns residency. A DAG's temporary context must not
+        # close a model still used by native UI or another task.
+        return None
+
+    def close(self) -> None:
+        # SeparatorCache.close() calls close on cached values. Eviction is
+        # performed by ModelCoordinator when a different residency is leased.
+        return None

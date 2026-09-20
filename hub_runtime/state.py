@@ -16,7 +16,8 @@ def model_spec(config, model, source=None, endpoint=None, inference_params=None)
         params.update(inference_params)
     return {"model": model, "model_dir": config.model_dir,
             "source": source or config.source, "endpoint": endpoint,
-            "inference_params": params, "debug": config.debug}
+            "inference_params": params, "debug": config.debug,
+            "max_concurrency": max(1, int(getattr(config, "max_queue_size", 1)))}
 
 
 def metadata_from_dict(metadata):

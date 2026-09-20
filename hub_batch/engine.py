@@ -11,23 +11,39 @@ from pymss.graph import SeparatorCache, load_comfy_file, run_dag
 from ttd_model_runtime.engine import engine_progress
 from ttd_model_runtime.protocol import NativeCancelled
 
-from .provider import ModelCoordinator
+from .provider import CoordinatedSeparator, ModelCoordinator, SharedModel
 
 RECIPES = ("duality-two-stems", "dedicated-me")
 BUDGET_BYTES = 8 * 1024 ** 3
 
 
 class BatchEngine:
-    def __init__(self, model_dir, separator_factory=None):
+    def __init__(self, model_dir, separator_factory=None, *, coordinator=None, profile_concurrency=1):
         self.model_dir = model_dir
-        # Profile DAGs run in one Hub GPU process.  Evict the previous model
-        # before a graph node requests another one; graph outputs are already
-        # materialized at that point, so this preserves single residency.
-        self.cache = SeparatorCache(factory=separator_factory, max_entries=1)
-        # Ordinary model calls use the same single-resident policy, with
-        # profile-declared same-model capacity handled by the coordinator.
+        self._owns_coordinator = coordinator is None
+        self._profile_concurrency = max(1, int(profile_concurrency))
         factory = separator_factory or SeparatorCache._default_factory
-        self.coordinator = ModelCoordinator(factory=factory)
+        # Profile DAGs run in one Hub GPU process. With a shared coordinator,
+        # cached entries are lazy facades and never own a second separator.
+        if coordinator is None:
+            self.coordinator = ModelCoordinator(factory=factory)
+            self.cache = SeparatorCache(factory=separator_factory, max_entries=1)
+        else:
+            self.coordinator = coordinator
+
+            def coordinated_factory(**kwargs):
+                def load_shared(**load_kwargs):
+                    value = factory(**load_kwargs)
+                    return value if isinstance(value, SharedModel) else SharedModel(value)
+
+                return CoordinatedSeparator(
+                    self.coordinator,
+                    load_shared,
+                    kwargs,
+                    max_concurrency=self._profile_concurrency,
+                )
+
+            self.cache = SeparatorCache(factory=coordinated_factory, max_entries=1)
         self.guard = threading.Lock()
         self.execution = threading.Lock()
         self.task_id = None
@@ -47,7 +63,7 @@ class BatchEngine:
             self.cancelled.set()
             return True
 
-    def run(self, task_id, recipe, inputs, output_dir):
+    def run(self, task_id, recipe, inputs, output_dir, *, max_concurrency=None):
         if recipe not in RECIPES:
             raise ValueError("unsupported recipe")
         if not self.execution.acquire(blocking=False):
@@ -64,6 +80,9 @@ class BatchEngine:
                 emit(event)
 
         files = []
+        previous_concurrency = self._profile_concurrency
+        if max_concurrency is not None:
+            self._profile_concurrency = max(1, int(max_concurrency))
         try:
             with self.guard:
                 if self.task_id != task_id:
@@ -105,11 +124,20 @@ class BatchEngine:
             with self.guard:
                 if self.task_id == task_id:
                     self.task_id = None
+            self._profile_concurrency = previous_concurrency
             self.execution.release()
+
+    def run_profile(self, task_id, profile, inputs, output_dir):
+        """Execute an immutable profile manifest through the DAG runner."""
+        return self.run(
+            task_id, profile.dag, inputs, output_dir,
+            max_concurrency=profile.max_concurrency,
+        )
 
     def close(self):
         self.cache.close()
-        self.coordinator.close()
+        if self._owns_coordinator:
+            self.coordinator.close()
 
     @staticmethod
     def _commit_manifest(output_dir, task_id, files):
@@ -149,7 +177,12 @@ class BatchEngine:
         spec = dict(model_name=model_name, model_dir=self.model_dir, device="cuda",
                     output_format="wav", store_dirs={stem: "" for stem in stems},
                     inference_params=dict(params or {}))
-        with self.coordinator.lease(**spec) as separator:
+        residency_key = ModelCoordinator.key_for({
+            "model": model_name, "model_dir": self.model_dir,
+            "inference_params": dict(params or {}),
+        })
+        with self.coordinator.lease(residency_key=residency_key, **spec) as resident:
+            separator = getattr(resident, "separator", resident)
             for index, path in enumerate(paths):
                 if self.cancelled.is_set():
                     raise NativeCancelled()
@@ -205,7 +238,12 @@ class BatchEngine:
             spec = dict(model_name=model_name, model_dir=self.model_dir, device="cuda",
                         output_format="wav", store_dirs={stem: "" for stem in stems},
                         inference_params=dict(params or {}))
-            with self.coordinator.lease(max_concurrency=max_concurrency, **spec) as separator:
+            residency_key = ModelCoordinator.key_for({
+                "model": model_name, "model_dir": self.model_dir,
+                "inference_params": dict(params or {}),
+            })
+            with self.coordinator.lease(max_concurrency=max_concurrency, residency_key=residency_key, **spec) as resident:
+                separator = getattr(resident, "separator", resident)
                 for index, path in enumerate(paths):
                     if self.cancelled.is_set():
                         raise NativeCancelled()
