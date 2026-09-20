@@ -1,11 +1,12 @@
 # 固定DAG批任务与Hub接入
 
 2026-09-19。本地实现与分层验证完成；未注册线上服务、未切换MSST/Gateway、未部署。
+2026-09-20。PYMSS 正式 Runtime 入口已接入 Profile/Batch 路由；原生 UI、普通模型调用和批任务共用一个 child-side ModelCoordinator。部署资产增加 Gateway 文件根挂载与异步入口本地准入路径；仍需候选镜像构建和真实 Hub/Gateway smoke。
 
 ## 实现边界
 
 新增独立入口 `python -m hub_batch`，复用原生DAG和真实Hub Runtime SDK。
-现有 `python -m hub_runtime` 的Studio/Cover行为与选择状态不变。
+现有 `python -m hub_runtime` 的Studio/Cover行为与选择状态不变。正式入口同时提供 `POST /v1/separations`（Profile）和 `POST /v1/batches`（固定DAG/Profile），查询、SSE和取消沿用同一 Runtime 进程。
 两份固定配方在 `hub_batch/recipes/`，请求不接受任意DAG或模型参数。
 
 - CPU任务owner、SQLite状态、异步202回执、状态查询、SSE快照、取消请求。
@@ -51,8 +52,9 @@ CPU宿主必须`CUDA_VISIBLE_DEVICES=''`，子进程只看租约授予的GPU。
 Runtime业务RPC设置execution_timeout=None，允许长批；控制调用仍使用SDK有界超时。
 实际Hub registration/policy中的budget_bytes应为8589934592，单实例/单任务执行。
 预算是容量预留，不是CUDA驱动硬限制，不能用环境变量声明替代真实Core授权。
-正式entry需只把POST `/v1/batches`列为新工作准入路径；查询/SSE/取消沿用
-平台认证的CPU路由，不能把它们当作新的推理提交。部署镜像包含hub_batch，但默认入口仍是Studio。
+正式entry需把POST `/v1/separations` 和 `/v1/batches`列为新工作准入路径；查询/SSE/取消沿用
+平台认证的CPU路由，不能把它们当作新的推理提交。部署镜像默认入口仍是Studio，但由同一 `hub_runtime` 提供这些路由。Gateway 文件根通过 `/TTD/04_应用/pymss` 共享挂载，
+`PYMSS_BATCH_INPUT_ROOT`、`PYMSS_BATCH_OUTPUT_ROOT` 和 `PYMSS_BATCH_STATE_DIR` 指向 Gateway 约定目录。
 
 ## 验证证据
 

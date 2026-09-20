@@ -13,6 +13,7 @@ from ttd_model_runtime.engine import progress_scope
 from ttd_model_runtime.protocol import AdmissionRejected, HubError, NativeCancelled
 
 from .engine import RECIPES
+from .provider import ProfileRegistry
 
 TERMINAL = {"succeeded", "failed", "cancelled", "unknown"}
 
@@ -100,8 +101,9 @@ class Owner:
 
 
 class Jobs:
-    def __init__(self, runtime, state_dir, input_root, output_root):
+    def __init__(self, runtime, state_dir, input_root, output_root, profile_registry: ProfileRegistry | None = None):
         self.runtime = runtime
+        self.profile_registry = profile_registry
         self.input_root = Path(input_root).resolve(strict=True)
         self.output_root = Path(output_root).resolve()
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -111,9 +113,20 @@ class Jobs:
         self.owner = None
         self.closed = False
 
-    def submit(self, recipe, paths, output_dir=None):
-        if recipe not in RECIPES or not paths:
-            raise ValueError("a supported recipe and input_paths are required")
+    def submit(self, recipe=None, paths=None, output_dir=None, *, profile=None, profile_version=None):
+        if not paths:
+            raise ValueError("input_paths are required")
+        manifest = None
+        if profile is not None:
+            if self.profile_registry is None:
+                raise ValueError("profile registry is not configured")
+            try:
+                manifest = self.profile_registry.resolve(str(profile), profile_version)
+            except KeyError as exc:
+                raise ValueError(f"profile not found: {exc.args[0]}") from None
+            recipe = manifest.dag
+        if recipe not in RECIPES:
+            raise ValueError("a supported recipe or profile is required")
         inputs = []
         for raw in paths:
             path = Path(raw).resolve(strict=True)
@@ -129,6 +142,7 @@ class Jobs:
                 raise ValueError("output_dir must be inside the configured output root")
             output.mkdir(parents=True, exist_ok=True)
             task = {"id": task_id, "status": "queued", "recipe": recipe,
+                    "profile": manifest.to_dict() if manifest is not None else None,
                     "input_paths": inputs, "output_dir": str(output), "files": [],
                     "processed_files": 0, "total_files": len(inputs), "created_at": time.time()}
             self.store.put(task)
@@ -174,7 +188,12 @@ class Jobs:
                     if owner.cancel.is_set():
                         owner.engine.cancel(task_id)
                 with progress_scope(event):
-                    files = owner.engine.run(task_id, task["recipe"], task["input_paths"], task["output_dir"])
+                    if task.get("profile") is not None:
+                        from .provider import ProfileManifest
+                        manifest = ProfileManifest.from_dict(task["profile"])
+                        files = owner.engine.run_profile(task_id, manifest, task["input_paths"], task["output_dir"])
+                    else:
+                        files = owner.engine.run(task_id, task["recipe"], task["input_paths"], task["output_dir"])
                 if any(item["status"] != "succeeded" for item in files):
                     raise FileFailed("one or more input files failed")
             status = "succeeded"

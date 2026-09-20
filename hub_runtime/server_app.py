@@ -37,7 +37,7 @@ from pymss.server.webui import register_webui_routes
 
 try:
     from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse, Response
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
 except ImportError as exc:  # pragma: no cover - exercised only without optional deps.
     raise RuntimeError("Install server dependencies with `pip install pymss[server]` or `uv sync --extra server`.") from exc
 
@@ -342,21 +342,22 @@ async def _parse_request(request, state, loaded, body=None):
 
 
 async def _run_separation(state, loaded, model, mix, stems):
-    """Preserve native admission and serialization while tracking actual GPU work."""
+    """Run native inference under the shared child-side model coordinator."""
     if state.model_loading:
         raise APIError(409, "model_operation_in_progress", "A model load or switch operation is in progress.")
     acquired = await state.limiter.acquire()
     if not acquired:
         raise APIError(429, "server_overloaded", "Inference queue is full.")
     try:
-        if state.model_loading:
-            raise APIError(409, "model_operation_in_progress", "A model load or switch operation is in progress.")
+        # The shared gate tracks the complete native activity. Its shared mode
+        # permits same-model overlap; model switching takes the exclusive mode
+        # and therefore drains these activities before changing residency.
         async with state.inference_lock:
             if state.model_loading:
                 raise APIError(409, "model_operation_in_progress", "A model load or switch operation is in progress.")
             if state.loaded is not loaded:
                 raise APIError(404, "model_not_found", f"Model {model!r} is not loaded by this process.", param="model")
-            spec = state.selected_spec
+            spec = dict(state.selected_spec or {})
 
             @state.runtime.task
             async def owned():
@@ -365,9 +366,8 @@ async def _run_separation(state, loaded, model, mix, stems):
                 mark_loaded(state, loaded, metadata)
                 return results
 
-            # Runtime.task settles real work before propagating cancellation.
-            # Therefore timeout/disconnect cannot release the native lock while
-            # the child still uses weights, unlike bare wait_for(to_thread()).
+            # Runtime.task settles actual child work before propagating
+            # cancellation, so the shared gate is held until GPU work ends.
             if state.config.request_timeout_seconds:
                 try:
                     return await asyncio.wait_for(owned(), timeout=state.config.request_timeout_seconds)
@@ -419,7 +419,7 @@ async def _load_or_switch_model(state, model, source, endpoint, inference_params
         state.model_loading_target = model
         effective_source, effective_endpoint = _effective_download_source(state, source, endpoint)
         spec = model_spec(state.config, model, effective_source, effective_endpoint, inference_params)
-        async with state.inference_lock:
+        async with state.inference_lock.exclusive():
             @state.runtime.task
             async def owned():
                 metadata = await asyncio.to_thread(state.runtime.get().load, spec, True)
@@ -633,7 +633,7 @@ async def _update_download_source(state, source, endpoint):
         state.download_lock.release()
 
 
-def build_app(config, runtime, *, initialize=True):
+def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=None):
     """Create the FastAPI application.
 
     Args:
@@ -647,6 +647,12 @@ def build_app(config, runtime, *, initialize=True):
     state = load_state(config, runtime, initialize=initialize)
     app = FastAPI(title="pymss server", version="1")
     app.state.pymss_state = state
+    app.state.pymss_jobs = jobs
+    app.state.pymss_profile_registry = profile_registry
+    if jobs is not None:
+        @app.on_event("shutdown")
+        async def close_provider_jobs():
+            await asyncio.to_thread(jobs.close)
     if config.webui:
         register_webui_routes(app)
 
@@ -910,5 +916,166 @@ def build_app(config, runtime, *, initialize=True):
         except Exception as exc:
             state.logger.exception("Encoding separation response failed")
             raise APIError(500, "separation_failed", str(exc), error_type="server_error")
+
+    def _provider_jobs():
+        if jobs is None:
+            raise APIError(503, "separation_unavailable", "Provider batch service is unavailable.")
+        return jobs
+
+    def _provider_task_payload(task):
+        """Expose a stable provider task view while retaining file paths.
+
+        The Gateway owns its durable public manifest; this response is only a
+        provider execution receipt. ``task_id`` and ``id`` are both emitted so
+        older adapters can roll forward without guessing a second identifier.
+        """
+        files = []
+        for item in task.get("files", []):
+            output_files = []
+            for output in item.get("outputs", item.get("output_files", [])) or []:
+                if isinstance(output, dict):
+                    path = output.get("path") or output.get("name")
+                else:
+                    path = output
+                if path:
+                    output_files.append(str(path))
+            files.append({
+                "index": item.get("index"),
+                "input": item.get("input"),
+                "status": "success" if item.get("status") == "succeeded" else item.get("status", "failed"),
+                "error": item.get("error"),
+                "output_files": output_files,
+                "outputs": item.get("outputs", []),
+            })
+        return {
+            "task_id": task["id"], "id": task["id"],
+            "status": task.get("status", "unknown"),
+            "state": task.get("status", "unknown"),
+            "profile": task.get("profile"), "recipe": task.get("recipe"),
+            "progress": task.get("progress"),
+            "processed_files": task.get("processed_files", 0),
+            "total_files": task.get("total_files", 0),
+            "files": files, "error": task.get("error"),
+        }
+
+    async def _batch_payload(request):
+        body = await _read_body(request, state)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise APIError(400, "invalid_request", "Request body must be valid JSON.")
+        if not isinstance(payload, dict):
+            raise APIError(400, "invalid_request", "JSON request body must be an object.")
+        inputs = payload.get("input_paths", payload.get("inputs"))
+        if not isinstance(inputs, list) or not inputs or any(not isinstance(item, str) for item in inputs):
+            raise APIError(400, "invalid_request", "inputs must be a non-empty list of paths.", param="inputs")
+        profile = payload.get("profile_id", payload.get("profile"))
+        profile_version = payload.get("profile_version")
+        recipe = payload.get("recipe")
+        if profile is None and recipe is None:
+            raise APIError(400, "invalid_request", "profile_id/profile or recipe is required.")
+        return payload, inputs, profile, profile_version, recipe
+
+    @app.post("/v1/separations", status_code=202)
+    async def submit_separation(request: Request):
+        """Submit a provider Profile task through the formal Runtime entry."""
+        _check_auth(request, state)
+        provider_jobs = _provider_jobs()
+        payload, inputs, profile, profile_version, recipe = await _batch_payload(request)
+        try:
+            task = provider_jobs.submit(
+                recipe=recipe,
+                paths=inputs,
+                output_dir=payload.get("output_dir"),
+                profile=profile,
+                profile_version=profile_version,
+            )
+            return _provider_task_payload(task)
+        except (ValueError, OSError) as exc:
+            raise APIError(400, "invalid_request", str(exc)) from None
+        except Exception as exc:
+            from hub_batch.jobs import Busy
+            if isinstance(exc, Busy):
+                raise APIError(429, "server_overloaded", str(exc)) from None
+            raise
+
+    @app.post("/v1/batches", status_code=202)
+    async def submit_batch(request: Request):
+        """Submit a fixed DAG or immutable Profile over one or more files."""
+        _check_auth(request, state)
+        provider_jobs = _provider_jobs()
+        payload, inputs, profile, profile_version, recipe = await _batch_payload(request)
+        try:
+            task = provider_jobs.submit(
+                recipe=recipe,
+                paths=inputs,
+                output_dir=payload.get("output_dir"),
+                profile=profile,
+                profile_version=profile_version,
+            )
+            return _provider_task_payload(task)
+        except (ValueError, OSError) as exc:
+            raise APIError(400, "invalid_request", str(exc)) from None
+        except Exception as exc:
+            from hub_batch.jobs import Busy
+            if isinstance(exc, Busy):
+                raise APIError(429, "server_overloaded", str(exc)) from None
+            raise
+
+    @app.get("/v1/batches/{task_id}")
+    async def provider_batch_status(task_id: str, request: Request):
+        _check_auth(request, state)
+        task = _provider_jobs().store
+        try:
+            return _provider_task_payload(task.get(task_id))
+        except KeyError:
+            raise APIError(404, "task_not_found", "Batch task was not found.") from None
+
+    @app.get("/v1/batches/{task_id}/result")
+    async def provider_batch_result(task_id: str, request: Request):
+        _check_auth(request, state)
+        try:
+            task = _provider_jobs().store.get(task_id)
+        except KeyError:
+            raise APIError(404, "task_not_found", "Batch task was not found.") from None
+        if task["status"] not in {"succeeded", "failed", "cancelled", "unknown"}:
+            raise APIError(409, "result_not_ready", "Batch result is not ready.")
+        return _provider_task_payload(task)
+
+    @app.post("/v1/batches/{task_id}/cancel")
+    async def provider_batch_cancel(task_id: str, request: Request):
+        _check_auth(request, state)
+        try:
+            return _provider_task_payload(_provider_jobs().cancel(task_id))
+        except KeyError:
+            raise APIError(404, "task_not_found", "Batch task was not found.") from None
+        except HubError as exc:
+            raise APIError(503, exc.code, str(exc)) from None
+
+    @app.get("/v1/batches/{task_id}/events")
+    async def provider_batch_events(task_id: str, request: Request):
+        _check_auth(request, state)
+        provider_jobs = _provider_jobs()
+        try:
+            provider_jobs.store.get(task_id)
+        except KeyError:
+            raise APIError(404, "task_not_found", "Batch task was not found.") from None
+
+        async def stream():
+            previous = None
+            while True:
+                try:
+                    task = provider_jobs.store.get(task_id)
+                except KeyError:
+                    return
+                payload = json.dumps(task, ensure_ascii=False)
+                if payload != previous:
+                    yield f"event: task\ndata: {payload}\n\n"
+                    previous = payload
+                if task["status"] in {"succeeded", "failed", "cancelled", "unknown"}:
+                    return
+                await asyncio.sleep(.25)
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
 
     return app
