@@ -78,3 +78,18 @@ Runtime业务RPC设置execution_timeout=None，允许长批；控制调用仍使
 正式接入前仍需候选镜像构建、独立运行定义与entry路由、完整Core→Node→GPU联调，
 随后适配Gateway/旧插件并验证原业务入口。OOM/失联的真实故障注入、本轮未覆盖的格式与
 音质验收也不能从短样本或单元测试推定通过。本次未提交、推送、发布或关闭MSST。
+
+
+## MSST 兼容 facade
+
+本服务同时提供旧 MSST provider 路径：`POST /api/v1/tasks/msst-batch?mode=sync|async|sse`、
+`GET /api/v1/tasks/{task_id}`、`/result`、`POST /cancel`。这条 facade 允许大雁 Gateway
+和海鸥保持原客户端合同；provider内部使用 PYMSS 普通 `model_name`，不是固定两个 profile。
+
+兼容层保留目录输入、range_start/range_end、extract_instrumental、共享 output_dir、
+SSE progress 和 `_Vocals`/`_Instrumental` 输出命名。单个提交固定一个模型；海鸥的 Dedicated
+由消费者提交两次模型任务，兼容层不隐式改写为DAG。Gateway仍负责大雁的target/style、
+认证、900秒、计费和Range，兼容层负责MSST原始批任务语义。
+
+当前 facade 是本地实现与测试阶段，尚未正式发布到 `http://msst`/原域名；正式切换前必须
+用真实 catalog模型、海鸥目录范围、Gateway结果下载和两消费者端到端 smoke 验收。

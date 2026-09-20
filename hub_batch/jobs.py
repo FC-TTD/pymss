@@ -111,7 +111,7 @@ class Jobs:
         self.owner = None
         self.closed = False
 
-    def submit(self, recipe, paths):
+    def submit(self, recipe, paths, output_dir=None):
         if recipe not in RECIPES or not paths:
             raise ValueError("a supported recipe and input_paths are required")
         inputs = []
@@ -124,8 +124,10 @@ class Jobs:
             if self.closed or self.owner is not None or self.store.pending():
                 raise Busy("another batch is active or its outcome is unknown")
             task_id = uuid4().hex
-            output = self.output_root / task_id
-            output.mkdir()
+            output = Path(output_dir).resolve() if output_dir else self.output_root / task_id
+            if not output.is_relative_to(self.output_root):
+                raise ValueError("output_dir must be inside the configured output root")
+            output.mkdir(parents=True, exist_ok=True)
             task = {"id": task_id, "status": "queued", "recipe": recipe,
                     "input_paths": inputs, "output_dir": str(output), "files": [],
                     "processed_files": 0, "total_files": len(inputs), "created_at": time.time()}

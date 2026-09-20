@@ -7,6 +7,7 @@ from ttd_model_runtime.integrations.fastapi import attach
 from .api import build_app
 from .engine import load_engine, completion, release
 from .jobs import Jobs
+from .msst_compat import CompatTasks
 
 
 def create_app():
@@ -14,8 +15,10 @@ def create_app():
                       gpu_process=True, execution_timeout=None)
     jobs = Jobs(runtime, os.environ["PYMSS_BATCH_STATE_DIR"],
                 os.environ["PYMSS_BATCH_INPUT_ROOT"], os.environ["PYMSS_BATCH_OUTPUT_ROOT"])
+    compat = CompatTasks(runtime, os.environ["PYMSS_BATCH_STATE_DIR"],
+                         os.environ["PYMSS_BATCH_INPUT_ROOT"], os.environ["PYMSS_BATCH_OUTPUT_ROOT"])
     runtime.pending_work = jobs.store.pending
-    return attach(build_app(jobs, os.getenv("PYMSS_API_KEY")), runtime=runtime)
+    return attach(build_app(jobs, os.getenv("PYMSS_API_KEY"), compat=compat), runtime=runtime)
 
 
 if __name__ == "__main__":
