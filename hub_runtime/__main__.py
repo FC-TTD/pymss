@@ -33,9 +33,17 @@ def default_profiles():
         ProfileManifest("dialogue-vocal", "2026-09-20.v1", "duality-two-stems",
                         outputs=("Vocals", "Instrumental"),
                         models=("melband_roformer_instvox_duality_v2.ckpt",), max_concurrency=1),
-        ProfileManifest("instrumental-separation", "2026-09-20.v1", "dedicated-me",
+        ProfileManifest("instrumental-separation", "2026-09-20.v1", "instrumental-only",
                         outputs=("Instrumental",),
                         models=("mel_band_roformer_instrumental_becruily.ckpt",), max_concurrency=1),
+        ProfileManifest("dialogue-and-instrumental", "2026-09-20.v1", "dedicated-me",
+                        outputs=("dialogue", "instrumental"),
+                        models=("melband_roformer_instvox_duality_v2.ckpt",
+                                "mel_band_roformer_instrumental_becruily.ckpt"), max_concurrency=1),
+        ProfileManifest("dialogue-and-instrumental-dedicated", "2026-09-20.v1", "dedicated-me",
+                        outputs=("dialogue", "instrumental"),
+                        models=("melband_roformer_instvox_duality_v2.ckpt",
+                                "mel_band_roformer_instrumental_becruily.ckpt"), max_concurrency=1),
     ])
 
 

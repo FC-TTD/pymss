@@ -71,3 +71,16 @@ def test_stable_profile_provider_shape_resolves_default_manifest(tmp_path):
             assert response.status_code == 400
     finally:
         compat.close()
+
+def test_default_profile_manifests_match_public_output_roles_and_dags():
+    registry = default_profiles()
+    assert registry.resolve("dialogue-vocal", "2026-09-20.v1").dag == "duality-two-stems"
+    assert registry.resolve("dialogue-vocal", "2026-09-20.v1").outputs == ("Vocals", "Instrumental")
+    assert registry.resolve("instrumental-separation", "2026-09-20.v1").dag == "instrumental-only"
+    assert registry.resolve("instrumental-separation", "2026-09-20.v1").outputs == ("Instrumental",)
+    for name in ("dialogue-and-instrumental", "dialogue-and-instrumental-dedicated"):
+        manifest = registry.resolve(name, "2026-09-20.v1")
+        assert manifest.dag == "dedicated-me"
+        assert manifest.outputs == ("dialogue", "instrumental")
+        assert len(manifest.models) == 2
+

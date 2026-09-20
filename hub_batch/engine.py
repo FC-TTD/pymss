@@ -13,7 +13,7 @@ from ttd_model_runtime.protocol import NativeCancelled
 
 from .provider import CoordinatedSeparator, ModelCoordinator, SharedModel
 
-RECIPES = ("duality-two-stems", "dedicated-me")
+RECIPES = ("duality-two-stems", "instrumental-only", "dedicated-me")
 BUDGET_BYTES = 8 * 1024 ** 3
 
 

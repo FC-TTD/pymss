@@ -1,0 +1,115 @@
+{
+  "version": 0.4,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "input_audio",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "pymss_mss_params",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "params",
+          "type": "MSS_PARAMS"
+        }
+      ],
+      "widgets_values": [
+        1,
+        "17640",
+        "352800",
+        false,
+        false,
+        false
+      ]
+    },
+    {
+      "id": 3,
+      "type": "mss_separate",
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 1
+        },
+        {
+          "name": "params",
+          "type": "MSS_PARAMS",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Instrumental (Audio)",
+          "type": "AUDIO"
+        },
+        {
+          "name": "Instrumental (String)",
+          "type": "STRING"
+        }
+      ],
+      "widgets_values": [
+        "mel_band_roformer_instrumental_becruily.ckpt",
+        "cuda",
+        true,
+        "huggingface",
+        "0",
+        false
+      ]
+    },
+    {
+      "id": 4,
+      "type": "pymss_save_audio",
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "widgets_values": [
+        "wav",
+        "instrumental",
+        "48000",
+        "PCM_24",
+        "PCM_24",
+        "320k"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      3,
+      0,
+      "AUDIO"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      1,
+      "MSS_PARAMS"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "AUDIO"
+    ]
+  ]
+}
