@@ -1,8 +1,52 @@
 """CPU selection metadata survives SDK engine eviction and reload."""
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from pymss.logger import get_separation_logger
+
+
+class InferenceGate:
+    """Shared inference gate with an exclusive model-switch mode.
+
+    Native requests for the resident model may overlap. A model load/switch
+    takes the exclusive mode and waits for every active request to finish.
+    ``locked()`` remains a useful activity probe for diagnostics and tests.
+    """
+
+    def __init__(self):
+        self._condition = asyncio.Condition()
+        self._active = 0
+        self._exclusive = False
+
+    def locked(self) -> bool:
+        return self._active > 0 or self._exclusive
+
+    async def __aenter__(self):
+        async with self._condition:
+            while self._exclusive:
+                await self._condition.wait()
+            self._active += 1
+        return self
+
+    async def __aexit__(self, *_exc):
+        async with self._condition:
+            self._active -= 1
+            self._condition.notify_all()
+
+    @asynccontextmanager
+    async def exclusive(self):
+        async with self._condition:
+            while self._exclusive or self._active:
+                await self._condition.wait()
+            self._exclusive = True
+        try:
+            yield self
+        finally:
+            async with self._condition:
+                self._exclusive = False
+                self._condition.notify_all()
+
 from pymss.model_registry import ModelEntry, resolve_model
 from pymss.server.state import (
     LoadedModel, RequestLimiter, ServerState, _preload_config,
@@ -65,7 +109,7 @@ def load_state(config, runtime, *, initialize=True):
     state = ServerState(
         config=config, logger=get_separation_logger(),
         operation_lock=asyncio.Lock(), limiter=RequestLimiter(config.max_queue_size),
-        model_lock=asyncio.Lock(), inference_lock=asyncio.Lock(), download_lock=asyncio.Lock(),
+        model_lock=asyncio.Lock(), inference_lock=InferenceGate(), download_lock=asyncio.Lock(),
     )
     state.runtime = runtime
     state.selected_spec = None

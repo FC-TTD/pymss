@@ -349,9 +349,9 @@ async def _run_separation(state, loaded, model, mix, stems):
     if not acquired:
         raise APIError(429, "server_overloaded", "Inference queue is full.")
     try:
-        # Snapshot the selected model under the short CPU state lock. The lock
-        # is released before GPU work, so same-model calls can run concurrently;
-        # model switching cannot clear selected_spec between the check and use.
+        # The shared gate tracks the complete native activity. Its shared mode
+        # permits same-model overlap; model switching takes the exclusive mode
+        # and therefore drains these activities before changing residency.
         async with state.inference_lock:
             if state.model_loading:
                 raise APIError(409, "model_operation_in_progress", "A model load or switch operation is in progress.")
@@ -359,21 +359,21 @@ async def _run_separation(state, loaded, model, mix, stems):
                 raise APIError(404, "model_not_found", f"Model {model!r} is not loaded by this process.", param="model")
             spec = dict(state.selected_spec or {})
 
-        @state.runtime.task
-        async def owned():
-            engine = state.runtime.get()
-            metadata, results = await asyncio.to_thread(engine.separate, spec, mix, stems)
-            mark_loaded(state, loaded, metadata)
-            return results
+            @state.runtime.task
+            async def owned():
+                engine = state.runtime.get()
+                metadata, results = await asyncio.to_thread(engine.separate, spec, mix, stems)
+                mark_loaded(state, loaded, metadata)
+                return results
 
-        # Runtime.task settles actual child work before propagating cancellation.
-        # Native UI and provider work synchronize in the shared ModelCoordinator.
-        if state.config.request_timeout_seconds:
-            try:
-                return await asyncio.wait_for(owned(), timeout=state.config.request_timeout_seconds)
-            except asyncio.TimeoutError:
-                raise APIError(504, "separation_timeout", "Separation request timed out.")
-        return await owned()
+            # Runtime.task settles actual child work before propagating
+            # cancellation, so the shared gate is held until GPU work ends.
+            if state.config.request_timeout_seconds:
+                try:
+                    return await asyncio.wait_for(owned(), timeout=state.config.request_timeout_seconds)
+                except asyncio.TimeoutError:
+                    raise APIError(504, "separation_timeout", "Separation request timed out.")
+            return await owned()
     finally:
         await state.limiter.release()
 
@@ -419,7 +419,7 @@ async def _load_or_switch_model(state, model, source, endpoint, inference_params
         state.model_loading_target = model
         effective_source, effective_endpoint = _effective_download_source(state, source, endpoint)
         spec = model_spec(state.config, model, effective_source, effective_endpoint, inference_params)
-        async with state.inference_lock:
+        async with state.inference_lock.exclusive():
             @state.runtime.task
             async def owned():
                 metadata = await asyncio.to_thread(state.runtime.get().load, spec, True)
@@ -922,6 +922,42 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
             raise APIError(503, "separation_unavailable", "Provider batch service is unavailable.")
         return jobs
 
+    def _provider_task_payload(task):
+        """Expose a stable provider task view while retaining file paths.
+
+        The Gateway owns its durable public manifest; this response is only a
+        provider execution receipt. ``task_id`` and ``id`` are both emitted so
+        older adapters can roll forward without guessing a second identifier.
+        """
+        files = []
+        for item in task.get("files", []):
+            output_files = []
+            for output in item.get("outputs", item.get("output_files", [])) or []:
+                if isinstance(output, dict):
+                    path = output.get("path") or output.get("name")
+                else:
+                    path = output
+                if path:
+                    output_files.append(str(path))
+            files.append({
+                "index": item.get("index"),
+                "input": item.get("input"),
+                "status": "success" if item.get("status") == "succeeded" else item.get("status", "failed"),
+                "error": item.get("error"),
+                "output_files": output_files,
+                "outputs": item.get("outputs", []),
+            })
+        return {
+            "task_id": task["id"], "id": task["id"],
+            "status": task.get("status", "unknown"),
+            "state": task.get("status", "unknown"),
+            "profile": task.get("profile"), "recipe": task.get("recipe"),
+            "progress": task.get("progress"),
+            "processed_files": task.get("processed_files", 0),
+            "total_files": task.get("total_files", 0),
+            "files": files, "error": task.get("error"),
+        }
+
     async def _batch_payload(request):
         body = await _read_body(request, state)
         try:
@@ -947,13 +983,14 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
         provider_jobs = _provider_jobs()
         payload, inputs, profile, profile_version, recipe = await _batch_payload(request)
         try:
-            return provider_jobs.submit(
+            task = provider_jobs.submit(
                 recipe=recipe,
                 paths=inputs,
                 output_dir=payload.get("output_dir"),
                 profile=profile,
                 profile_version=profile_version,
             )
+            return _provider_task_payload(task)
         except (ValueError, OSError) as exc:
             raise APIError(400, "invalid_request", str(exc)) from None
         except Exception as exc:
@@ -969,13 +1006,14 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
         provider_jobs = _provider_jobs()
         payload, inputs, profile, profile_version, recipe = await _batch_payload(request)
         try:
-            return provider_jobs.submit(
+            task = provider_jobs.submit(
                 recipe=recipe,
                 paths=inputs,
                 output_dir=payload.get("output_dir"),
                 profile=profile,
                 profile_version=profile_version,
             )
+            return _provider_task_payload(task)
         except (ValueError, OSError) as exc:
             raise APIError(400, "invalid_request", str(exc)) from None
         except Exception as exc:
@@ -989,15 +1027,26 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
         _check_auth(request, state)
         task = _provider_jobs().store
         try:
-            return task.get(task_id)
+            return _provider_task_payload(task.get(task_id))
         except KeyError:
             raise APIError(404, "task_not_found", "Batch task was not found.") from None
+
+    @app.get("/v1/batches/{task_id}/result")
+    async def provider_batch_result(task_id: str, request: Request):
+        _check_auth(request, state)
+        try:
+            task = _provider_jobs().store.get(task_id)
+        except KeyError:
+            raise APIError(404, "task_not_found", "Batch task was not found.") from None
+        if task["status"] not in {"succeeded", "failed", "cancelled", "unknown"}:
+            raise APIError(409, "result_not_ready", "Batch result is not ready.")
+        return _provider_task_payload(task)
 
     @app.post("/v1/batches/{task_id}/cancel")
     async def provider_batch_cancel(task_id: str, request: Request):
         _check_auth(request, state)
         try:
-            return _provider_jobs().cancel(task_id)
+            return _provider_task_payload(_provider_jobs().cancel(task_id))
         except KeyError:
             raise APIError(404, "task_not_found", "Batch task was not found.") from None
         except HubError as exc:
