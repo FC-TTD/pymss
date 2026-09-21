@@ -22,6 +22,7 @@ from ttd_model_runtime.runtime import Runtime
 
 from hub_runtime.__main__ import create_app, describe
 from hub_runtime.native import NativeBackend, describe_loaded
+from hub_batch.provider import ModelCoordinator, SharedModel
 from hub_runtime.server_app import _load_or_switch_model, _run_separation
 from hub_runtime.state import metadata_from_dict
 
@@ -319,6 +320,36 @@ class NativeBoundaryTests(unittest.TestCase):
             self.assertEqual(len(built), 2)
             backend.close()
             self.assertTrue(built[1].separator.closed)
+
+    def test_coordinated_native_backend_removes_runtime_only_concurrency_field(self):
+        class Separator:
+            model_type = "bs_roformer"
+
+            def separate(self, mix, pbar=False, stems=None):
+                return {stem: mix for stem in (stems or ["vocals"])}
+
+        seen = []
+
+        def factory(**kwargs):
+            seen.append(dict(kwargs))
+            return SharedModel(Separator(), metadata(kwargs["model"]))
+
+        coordinator = ModelCoordinator(factory)
+        backend = NativeBackend(coordinator=coordinator)
+        spec = {
+            "model": MODEL, "model_dir": "/models", "source": "hf-mirror",
+            "endpoint": None, "inference_params": {}, "max_concurrency": 3,
+        }
+        try:
+            desc, results = backend.separate(spec, np.zeros(16), ["vocals"])
+            self.assertEqual(desc["model_id"], MODEL)
+            self.assertIn("vocals", results)
+            self.assertEqual(seen, [{
+                "model": MODEL, "model_dir": "/models", "source": "hf-mirror",
+                "endpoint": None, "inference_params": {},
+            }])
+        finally:
+            coordinator.close()
 
     def test_actual_sdk_child_roundtrip_and_acknowledged_release(self):
         from ttd_model_runtime.engine import ProcessModel
