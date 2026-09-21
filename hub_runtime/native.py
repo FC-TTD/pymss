@@ -73,12 +73,14 @@ class NativeBackend:
             return describe_loaded(self.loaded)
 
         key = self._residency_key(spec)
+        lease_spec = dict(spec)
+        max_concurrency = lease_spec.pop("max_concurrency", 1)
         with self.coordinator.lease(
-            max_concurrency=spec.get("max_concurrency", 1),
+            max_concurrency=max_concurrency,
             residency_key=key,
             factory=self._native_factory,
             replace=force,
-            **spec,
+            **lease_spec,
         ) as shared:
             metadata = getattr(shared, "metadata", None) or self._metadata_from_spec(spec)
         self.spec = dict(spec)
@@ -96,11 +98,13 @@ class NativeBackend:
             return metadata, results
 
         key = self._residency_key(spec)
+        lease_spec = dict(spec)
+        max_concurrency = lease_spec.pop("max_concurrency", 1)
         with self.coordinator.lease(
-            max_concurrency=spec.get("max_concurrency", 1),
+            max_concurrency=max_concurrency,
             residency_key=key,
             factory=self._native_factory,
-            **spec,
+            **lease_spec,
         ) as shared:
             metadata = getattr(shared, "metadata", None) or self._metadata_from_spec(spec)
             separator = getattr(shared, "separator", shared)
