@@ -1074,7 +1074,7 @@ class MSSeparator:
             return model, config
 
         if self.model_type in LEGACY_DEMUCS_MODEL_TYPES:
-            from .modules.legacy_demucs import load_legacy_demucs_model
+            from pymss_core.modules.legacy_demucs import load_legacy_demucs_model
 
             config_path = self.config_path if self.config_path_given else None
             model, config = load_legacy_demucs_model(self.model_path, config_path)

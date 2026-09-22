@@ -102,7 +102,7 @@ def get_model_from_config(model_type, config_path, model_kwargs_override=None):
         )
     if model_type == "bandit_v2":
         config = load_config(config_path)
-        from .modules.bandit_v2.bandit import Bandit
+        from pymss_core.modules.bandit_v2.bandit import Bandit
 
         return Bandit(**config.kwargs), config
     return _core_get_model_from_config(model_type, config_path, model_kwargs_override=model_kwargs_override)
@@ -1145,7 +1145,7 @@ def demix(
         )
     mix = torch.tensor(mix, dtype=torch.float32)
     if model_type in {"demucs", "tasnet", "legacy_demucs", "legacy_tasnet"}:
-        from .modules.legacy_demucs import apply_legacy_model
+        from pymss_core.modules.legacy_demucs import apply_legacy_model
 
         sample_rate = int(config.training.samplerate)
         progress = _ProgressContext(
