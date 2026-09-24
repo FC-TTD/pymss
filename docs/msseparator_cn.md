@@ -54,7 +54,7 @@ separator = MSSeparator.from_model_name("my_bs")
 
 ```python
 separator = MSSeparator(
-    model_type="htdemucs",
+    model_type="auto",
     model_path="path/to/model",
     config_path="path/to/config.yaml",
     device="auto",
@@ -85,11 +85,13 @@ separator = MSSeparator(
 )
 ```
 
+`model_type="auto"` 会在加载权重前调用 pymss-core 的 YAML 架构识别。配置中的显式架构声明优先于结构特征；声明冲突或信息不足时抛出 `ModelTypeDetectionError`（继承 `RuntimeError`），手动指定架构可覆盖自动识别。支持识别 BS/Mel RoFormer 与 Conformer、HTDemucs、MDX23C、SCNet、Apollo、Bandit v1/v2 的配置结构。BS PolarFormer 使用 `bs_roformer`，HyperACE 会进一步根据权重键区分。省略了识别特征的配置仍可能需要手动选择；没有 YAML 的 VR 和旧版模型需要显式指定类型。
+
 ## 构造函数参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `model_type` | `str` | 必填 | 模型架构或运行类型。常见值包括 `bs_roformer`、`bs_conformer`、`mel_band_roformer`、`mel_band_conformer`、`htdemucs`、`mdx23c`、`bandit`、`bandit_v2`、`scnet`、`apollo`、`vr`、`legacy_demucs`、`legacy_tasnet`。使用 catalog 模型时通常不需要手动设置。 |
+| `model_type` | `str` | 必填 | `auto` 根据 YAML 自动识别，或显式指定模型架构与运行类型。常见值包括 `bs_roformer`、`bs_conformer`、`mel_band_roformer`、`mel_band_conformer`、`htdemucs`、`mdx23c`、`bandit`、`bandit_v2`、`scnet`、`apollo`、`vr`、`legacy_demucs`、`legacy_tasnet`。使用 catalog 模型时通常不需要手动设置。 |
 | `model_path` | `str` | 必填 | 模型权重文件路径。扩展名取决于模型类型，例如 `.ckpt`、`.th`、`.pth`。 |
 | `config_path` | `str \| None` | `None` | MSS 类模型使用的 YAML 配置路径。不传时，pymss 会尝试使用 `model_path + ".yaml"`。VR 模型使用内置 VR 元数据，不使用 MSS YAML 配置。 |
 | `device` | `str` | `"auto"` | 运行设备。可选值为 `auto`、`cpu`、`cuda`、`mps`、`mlx`。`auto` 优先选择 CUDA，其次 Apple MPS，最后 CPU。`mlx` 是 Apple Silicon MLX 后端的公开快捷写法，内部会通过 `device="mps"` 和 MLX 模型参数运行。 |
@@ -225,7 +227,7 @@ success_files = separator.process_folder("songs")
 
 如果 `input_folder` 是文件夹，该方法会把文件夹直属子文件作为候选输入，不会递归遍历子文件夹。
 
-### `separate(mix, pbar=True, stems=None)`
+### `separate(mix, pbar=True, stems=None, *, channel_layout=None)`
 
 对已经加载好的音频数组执行分离，并返回 `dict[stem_name, audio_array]`。
 
@@ -235,6 +237,27 @@ vocals = results["vocals"]
 ```
 
 `stems` 可以是 `None`、单个音轨名，或音轨名列表。为 `None` 时返回模型的全部音轨。输出 `normalize=True` 时，只会在返回的这些音轨之间计算归一化增益。
+
+输入数组使用 `(samples,)` 或 `(channels, samples)`，返回数组通常使用 `(samples, channels)`。
+
+| 输入 | 模型 | 处理方式与输出 |
+|---|---|---|
+| 单声道 | 单声道 | 推理一次，输出单声道。 |
+| 单声道 | 立体声 | 复制输入声道，模型结果按声道取平均，输出单声道。 |
+| 立体声 | 单声道 | 左右声道分别推理，再合成立体声。 |
+| 立体声 | 立体声 | 保持立体声推理与输出。 |
+| 大于两个声道 | 单声道 | 所有输入声道取平均，输出单声道。 |
+| 大于两个声道 | 立体声 | 通过 PyAV 使用 FFmpeg 声道混合规则降混，输出立体声。 |
+
+输出归一化在合并声道后执行，保留左右声道的相对音量。单声道模型处理立体声输入时需要两次推理，进度包含两次推理及启用的 TTA 轮次。
+
+`process_folder()` 按文件中记录的声道布局降混。已经加载的多声道数组可通过 `channel_layout` 指定源声道顺序，例如 `"5.1(side)"`；未指定时采用 FFmpeg 对该声道数的默认布局，没有默认布局的声道数必须显式指定。Apollo 原生支持单声道和立体声，更大的输入会降混成立体声。
+
+在 `process_folder()` 外读取文件时，可使用 `load_audio(path, downmix_stereo=True)` 保留单声道和立体声输入，并将更多声道降混成立体声。默认的 `load_audio()` 仍保留源文件的全部声道。
+
+`load_audio(path, return_layout=True)` 返回 `(audio, sample_rate, channel_layout)`，普通调用仍返回两个值。两种工作流的内置文件加载器都会保留布局，经不改变声道的处理节点传到分离入口。自定义加载器返回 `(audio, sample_rate)` 时，沿用原有的单声道/立体声数组方向识别；返回三个值时，二维数组采用声道优先的 `(channels, samples)`，单声道也可使用一维数组。图工作流调用方可显式设置 `AudioArtifact.channel_layout`。模型结果使用新的单声道或立体声布局。合并不兼容的多声道布局，或在 ensemble 中截断多声道输入时，图节点会明确报错，避免丢失声道位置。
+
+文件没有声道位置元数据时，加载器保留 `"3 channels"` 这样的未指定布局。librosa 成功解码但系统没有安装 ffprobe 时也采用这一规则。单声道模型仍可对这些声道取平均；工作流降混成立体声时需要明确的声道位置，缺失时会报错，不会猜测声道顺序。
 
 ### `save_audio(audio, sr, file_name, store_dir)`
 

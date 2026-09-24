@@ -7,15 +7,17 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import torch
 import numpy as np
+from yaml import YAMLError
 import platform
 import subprocess
 from time import time
 from tqdm import tqdm
 
-from .audio_io import load_audio, save_audio
+from .audio_io import downmix_to_stereo, load_audio, save_audio
 from .utils import _resolve_use_amp, clear_mlx_cache, demix, get_model_from_config
 from .logger import get_separation_logger, set_log_level
-from .config import AttrDict
+from .config import AttrDict, load_config
+from pymss_core import ModelTypeDetectionError, detect_model_type
 
 
 INFERENCE_PARAM_TARGETS = {
@@ -333,16 +335,16 @@ def _infer_mel_band_roformer_mlp_hidden_layers(state_dict):
     return len(layer_indices) - 1
 
 
-def _store_torch_model_on_cpu_for_mlx(config, device):
-    """Implement the store torch model on cpu for mlx helper.
+def _store_torch_model_on_cpu_for_mlx(model, device):
+    """Keep weights on CPU only when the model actually uses full MLX inference.
 
     Args:
-        config (AttrDict | dict): Loaded pymss configuration.
+        model (torch.nn.Module): Model after runtime backend selection.
         device (Any): Device value.
 
     Returns:
         Any: Computed result."""
-    return torch.device(device).type == "mps" and config.inference.get("mps_model_backend", "torch") == "mlx_full"
+    return torch.device(device).type == "mps" and getattr(model, "mps_model_backend", "torch") == "mlx_full"
 
 
 def _coerce_mps_float64(module):
@@ -373,18 +375,16 @@ def _coerce_cpu_low_precision(module):
                 child._buffers[name] = buffer.float()
 
 
-def _model_is_stereo(model_type, config):
-    """Implement the model is stereo helper.
-
-    Args:
-        model_type (Any): Model type value.
-        config (AttrDict | dict): Loaded pymss configuration.
-
-    Returns:
-        Any: Computed result."""
+def _model_input_channels(model_type, config, model=None):
+    """Return the model's input channel count, or None for flexible models."""
     if model_type == "vr":
-        return True
-    if model_type in [
+        return 2
+    if model_type == "apollo":
+        return None
+    model = getattr(model, "module", model)
+    channels = getattr(model, "audio_channels", None)
+    model_config = config.get("model", {})
+    if channels is None and model_type in [
         "bs_roformer",
         "bs_roformer_hyperace",
         "bs_conformer",
@@ -392,41 +392,42 @@ def _model_is_stereo(model_type, config):
         "mel_band_conformer",
         *LEGACY_DEMUCS_MODEL_TYPES,
     ]:
-        return config.model.get("stereo", True)
-    return True
+        default_stereo = model_type in LEGACY_DEMUCS_MODEL_TYPES
+        channels = 2 if getattr(model, "stereo", model_config.get("stereo", default_stereo)) else 1
+    if channels is None:
+        if model_type == "mdx23c":
+            channels = config.get("audio", {}).get("num_channels", 2)
+        elif model_type == "htdemucs":
+            channels = config.get("training", {}).get("channels", 2)
+        elif model_type == "bandit":
+            channels = model_config.get("in_channel", 2)
+        elif model_type == "bandit_v2":
+            channels = getattr(model, "in_channels", config.get("kwargs", {}).get("in_channels", 2))
+        else:
+            channels = model_config.get("audio_channels", 2)
+    channels = int(channels)
+    if channels not in (1, 2):
+        raise ValueError(f"Expected a mono or stereo model, got {channels} input channels.")
+    return channels
 
 
-def _prepare_mix_channels(mix, is_stereo, logger):
-    """Implement the prepare mix channels helper.
-
-    Args:
-        mix (np.ndarray): Mix value.
-        is_stereo (Any): Is stereo value.
-        logger (logging.Logger | None): Optional logger for progress messages.
-
-    Returns:
-        Any: Computed result."""
+def _prepare_mix_channels(mix, is_stereo, logger, sample_rate=44100, channel_layout=None):
+    """Adapt one inference input to the model's channel count."""
     from .plugins.builtins import to_mono
 
-    if is_stereo and len(mix.shape) == 1:
+    mix = mix[None, :] if mix.ndim == 1 else mix
+    if is_stereo and mix.shape[0] == 1:
         if logger:
-            logger.warning("Track is mono, but model is stereo, adding a second channel.")
-        return np.stack([mix, mix], axis=0)
-    if is_stereo and len(mix.shape) == 2 and mix.shape[0] == 1:
-        # [1, N] channel-first mono (e.g. graph AudioArtifact normalizes 1-D
-        # arrays to [1, N]) — duplicate the channel for stereo models.
+            logger.debug("Duplicating mono input for stereo model inference.")
+        return np.repeat(mix, 2, axis=0)
+    if is_stereo and mix.shape[0] > 2:
         if logger:
-            logger.warning("Track is mono, but model is stereo, adding a second channel.")
-        return np.concatenate([mix, mix], axis=0)
-    if is_stereo and len(mix.shape) > 2:
-        logger.warning("Track has more than 2 channels, taking mean of all channels and adding a second channel.")
-        mono = to_mono(mix)
-        return np.stack([mono, mono], axis=0)
-    if not is_stereo:
-        if len(mix.shape) != 1:
-            logger.warning("Track has more than 1 channels, but model is mono, taking mean of all channels.")
-            return to_mono(mix)[None, :]
-        return mix[None, :]
+            logger.info("Downmixing multichannel input to stereo for model inference.")
+        return downmix_to_stereo(mix, sample_rate, channel_layout)
+    if not is_stereo and mix.shape[0] > 1:
+        if logger:
+            logger.info("Averaging input channels for mono model inference.")
+        return to_mono(mix)[None, :]
     return mix
 
 
@@ -476,7 +477,7 @@ def _normalize_outputs(results, enabled, logger, target_peak=OUTPUT_NORMALIZE_PE
         return results
 
     logger.debug(f"Normalize output stems with peak: {peak}, target_peak: {target_peak}")
-    return {stem: normalize_peak(audio, target_peak=target_peak) for stem, audio in results.items()}
+    return {stem: normalize_peak(audio, target_peak=target_peak, reference_peak=peak) for stem, audio in results.items()}
 
 
 def _destandardize(estimates, stats):
@@ -658,7 +659,9 @@ class MSSeparator:
     or need full control over runtime parameters.
 
     Args:
-        model_type (str): Model architecture/runtime type. Common values
+        model_type (str): Model architecture/runtime type, or ``auto`` to detect
+            it from the YAML configuration. Unknown or ambiguous configurations
+            raise ``ModelTypeDetectionError`` (a ``RuntimeError``) before loading weights. Common explicit values
             include ``bs_roformer``, ``bs_conformer``, ``mel_band_roformer``,
             ``mel_band_conformer``, ``htdemucs``, ``mdx23c``, ``bandit``,
             ``bandit_v2``, ``scnet``, ``apollo``, ``vr``, ``legacy_demucs``,
@@ -769,7 +772,9 @@ class MSSeparator:
         """Initialize and load a separator from explicit model files.
 
         Args:
-            model_type (str): Runtime model family. Catalog users usually get
+            model_type (str): Runtime model family, or ``auto`` to detect it
+                from YAML. Unknown or ambiguous configurations raise ModelTypeDetectionError.
+                Catalog users usually get
                 this value from ``MSSeparator.from_model_name()`` instead of
                 setting it manually.
             model_path (str | os.PathLike): Model weights path.
@@ -826,13 +831,22 @@ class MSSeparator:
             raise ValueError("model_path is required")
 
         logger = logger if logger is not None else get_separation_logger()
-        device, inference_params = _resolve_public_device(device, inference_params, logger)
 
         self.model_type = model_type
 
         self.model_path = model_path
         self.config_path_given = config_path is not None
-        self.config_path = config_path if config_path else (model_path + ".yaml")
+        self.config_path = config_path if config_path else (os.fspath(model_path) + ".yaml")
+        if self.model_type == "auto":
+            try:
+                model_config = load_config(self.config_path)
+            except (OSError, UnicodeError, YAMLError) as exc:
+                raise ModelTypeDetectionError(
+                    "Cannot determine model_type: auto requires a readable YAML configuration. "
+                    "Check config_path or set model_type explicitly."
+                ) from exc
+            self.model_type = detect_model_type(model_config)
+        device, inference_params = _resolve_public_device(device, inference_params, logger)
         self.output_format = output_format
         self.use_tta = use_tta
         self.store_dirs = store_dirs
@@ -1113,7 +1127,7 @@ class MSSeparator:
         if torch.device(self.device).type == "cpu":
             _coerce_cpu_low_precision(model)
 
-        keep_torch_model_cpu = _store_torch_model_on_cpu_for_mlx(config, self.device)
+        keep_torch_model_cpu = _store_torch_model_on_cpu_for_mlx(model, self.device)
         if len(self.device_ids) > 1 and not keep_torch_model_cpu:
             model = torch.nn.DataParallel(model, device_ids=self.device_ids)
         model = model.to("cpu" if keep_torch_model_cpu else self.device)
@@ -1187,6 +1201,12 @@ class MSSeparator:
             for module in model.modules():
                 if hasattr(module, "set_mps_model_backend"):
                     module.set_mps_model_backend(model_backend, compute_dtype)
+            effective_backend = getattr(model, "mps_model_backend", "torch")
+            if effective_backend != model_backend:
+                self.logger.warning(
+                    f"Requested MPS model backend {model_backend!r} is unavailable for "
+                    f"{type(model).__name__}; using {effective_backend!r}"
+                )
         backend = config.inference.get("mps_attention_backend", None)
         min_tokens = config.inference.get("mps_mlx_min_tokens", 128)
         if backend is not None:
@@ -1299,7 +1319,7 @@ class MSSeparator:
         return save_ok
 
     @staticmethod
-    def _submit_load(load_executor, paths, index, sample_rate):
+    def _submit_load(load_executor, paths, index, sample_rate, downmix_stereo=False):
         """Submit the next audio load job to the load executor.
 
         Args:
@@ -1311,7 +1331,9 @@ class MSSeparator:
         Returns:
             concurrent.futures.Future | None: Future for the submitted load, or
             None when ``index`` is outside ``paths``."""
-        return None if index >= len(paths) else load_executor.submit(load_audio, paths[index], sr=sample_rate, mono=False)
+        return None if index >= len(paths) else load_executor.submit(
+            load_audio, paths[index], sr=sample_rate, mono=False, downmix_stereo=downmix_stereo
+        )
 
     def _submit_save_outputs(self, save_executor, results, sr, file_name):
         """Submit save jobs for all returned stems.
@@ -1459,6 +1481,7 @@ class MSSeparator:
         )
 
         success_files, pending_saves = [], deque()
+        downmix_stereo = _model_input_channels(self.model_type, self.config, self.model) != 1
 
         progress = tqdm(all_mixtures_path, desc="Total progress") if not self.debug else None
         try:
@@ -1466,7 +1489,7 @@ class MSSeparator:
                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="pymss-load") as load_executor,
                 ThreadPoolExecutor(max_workers=2, thread_name_prefix="pymss-save") as save_executor,
             ):
-                load_future = self._submit_load(load_executor, all_mixtures_path, 0, sample_rate)
+                load_future = self._submit_load(load_executor, all_mixtures_path, 0, sample_rate, downmix_stereo)
 
                 for index, path in enumerate(all_mixtures_path):
                     mix = None
@@ -1477,10 +1500,12 @@ class MSSeparator:
                         mix, sr = load_future.result()
                     except Exception as e:
                         self.logger.warning(f"Cannot process track: {path}, error: {str(e)}")
-                        load_future = self._submit_load(load_executor, all_mixtures_path, index + 1, sample_rate)
+                        load_future = self._submit_load(
+                            load_executor, all_mixtures_path, index + 1, sample_rate, downmix_stereo
+                        )
                         continue
 
-                    load_future = self._submit_load(load_executor, all_mixtures_path, index + 1, sample_rate)
+                    load_future = self._submit_load(load_executor, all_mixtures_path, index + 1, sample_rate, downmix_stereo)
 
                     self.logger.debug(f"Starting separation process for audio_file: {path}")
                     try:
@@ -1516,20 +1541,26 @@ class MSSeparator:
                 progress.close()
         return success_files
 
-    def separate(self, mix, pbar=True, stems=None):
+    def separate(self, mix, pbar=True, stems=None, *, channel_layout=None):
         """Run separation on an already loaded audio array.
 
         Args:
-            mix (np.ndarray): Input waveform. Mono and stereo arrays are
-                accepted; channel layout is adjusted to match the model.
+            mix (np.ndarray): Input waveform shaped ``(samples,)`` or
+                ``(channels, samples)``. Mono and stereo inputs retain their
+                channel count in the output. Multichannel inputs produce mono
+                output with mono models, and stereo output with stereo models.
             pbar (bool, optional): Whether lower-level inference may display
                 progress bars. Defaults to True.
             stems (str | Sequence[str] | None, optional): Stem name or stem
                 names to return. ``None`` returns all model stems. Defaults to
                 None.
+            channel_layout (str | None, optional): Source layout for
+                multichannel arrays, such as ``"5.1(side)"``. When omitted,
+                FFmpeg's default layout for the channel count is used.
 
         Returns:
-            dict[str, np.ndarray]: Mapping of stem name to separated audio.
+            dict[str, np.ndarray]: Mapping of stem name to sample-major audio,
+                normally shaped ``(samples, channels)``.
 
         Example:
             >>> results = separator.separate(audio, stems=["vocals", "instrumental"])
@@ -1538,9 +1569,9 @@ class MSSeparator:
         Notes:
             When output ``normalize=True``, the shared normalization gain is
             computed only across the returned stems."""
-        return self._separate(mix, pbar=pbar, stems=stems)
+        return self._separate(mix, pbar=pbar, stems=stems, channel_layout=channel_layout)
 
-    def _separate(self, mix, pbar, stems=None):
+    def _separate(self, mix, pbar, stems=None, channel_layout=None):
         """Internal separation implementation.
 
         Args:
@@ -1557,9 +1588,24 @@ class MSSeparator:
             standardization when enabled, runs TTA variants when requested,
             builds stem results, and finally applies linked output peak
             normalization when ``self.output_normalize`` is true."""
-        mix = _prepare_mix_channels(mix, _model_is_stereo(self.model_type, self.config), self.logger)
+        mix = np.asarray(mix, dtype=np.float32)
+        if mix.ndim not in (1, 2) or not mix.size:
+            raise ValueError("Expected non-empty audio shaped (samples,) or (channels, samples).")
+        input_channels = 1 if mix.ndim == 1 else mix.shape[0]
+        model_channels = _model_input_channels(self.model_type, self.config, self.model)
+        sample_rate = self.config.audio.get("sample_rate", 44100)
+        split_stereo = input_channels == 2 and model_channels == 1
+        if split_stereo:
+            self.logger.info("Separating left and right channels independently with a mono model.")
+            mixes = [mix[:1], mix[1:2]]
+        else:
+            is_stereo = model_channels == 2 or (model_channels is None and input_channels > 1)
+            mixes = [_prepare_mix_channels(mix, is_stereo, self.logger, sample_rate, channel_layout)]
         if self.model_type == "vr":
-            results = self.model.separate_array(mix, self.config.audio.get("sample_rate", 44100))
+            results = self.model.separate_array(mixes[0], sample_rate)
+            if input_channels == 1:
+                results = {stem: audio.mean(axis=1, keepdims=True) if audio.ndim == 2 else audio
+                           for stem, audio in results.items()}
             return _normalize_outputs(results, self.output_normalize, self.logger)
 
         instruments, source_indices = _resolve_instruments(self.config, stems)
@@ -1568,26 +1614,38 @@ class MSSeparator:
                 "Target instrument is not null, set primary_stem to target_instrument, secondary_stem will be calculated by mix - target_instrument"
             )
 
-        mix_orig = mix.copy()
-        mix, standardize_stats = _standardize_mix(mix, self.config.inference.get("normalize", False), self.logger)
-        full_result = [
-            demix(
-                self.config,
-                self.model,
-                track,
-                self.device,
-                pbar=pbar,
-                model_type=self.model_type,
-                source_indices=source_indices,
-                progress_callback=self.progress_callback,
+        channel_results = []
+        variants_per_mix = 3 if self.use_tta else 1
+        passes = len(mixes) * variants_per_mix
+        for channel_index, channel_mix in enumerate(mixes):
+            mix_orig = channel_mix.copy()
+            prepared, standardize_stats = _standardize_mix(
+                channel_mix, self.config.inference.get("normalize", False), self.logger
             )
-            for track in _tta_variants(mix, self.use_tta, self.logger)
-        ]
+            full_result = []
+            for variant_index, track in enumerate(_tta_variants(prepared, self.use_tta, self.logger)):
+                callback = self.progress_callback
+                if callback is not None and passes > 1:
+                    pass_index = channel_index * variants_per_mix + variant_index
 
-        self.logger.debug("Finished demixing tracks.")
-        waveforms = _merge_tta_results(full_result)
-        self.logger.debug(f"Starting to extract waveforms for instruments: {instruments}")
-        results = _build_results(waveforms, instruments, mix_orig, self.config, standardize_stats, self.logger)
+                    def callback(done, total, message, pass_index=pass_index):
+                        self.progress_callback(pass_index * total + done, passes * total, message)
+
+                full_result.append(demix(
+                    self.config, self.model, track, self.device, pbar=pbar,
+                    model_type=self.model_type, source_indices=source_indices, progress_callback=callback,
+                ))
+            waveforms = _merge_tta_results(full_result)
+            channel_results.append(
+                _build_results(waveforms, instruments, mix_orig, self.config, standardize_stats, self.logger)
+            )
+
+        results = channel_results[0]
+        if split_stereo:
+            results = {stem: np.column_stack((audio, channel_results[1][stem])) for stem, audio in results.items()}
+        elif input_channels == 1:
+            results = {stem: audio.mean(axis=1, keepdims=True) if audio.ndim == 2 else audio
+                       for stem, audio in results.items()}
         results = _normalize_outputs(results, self.output_normalize, self.logger)
         self.logger.debug("Separation process completed.")
         return results

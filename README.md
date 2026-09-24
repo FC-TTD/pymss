@@ -277,7 +277,7 @@ from pymss import MSSeparator, get_separation_logger
 
 # init
 separator = MSSeparator(
-    model_type='htdemucs', 
+    model_type='auto',
     model_path='path/to/model',
     config_path='path/to/config',
     device='cuda',
@@ -304,11 +304,13 @@ with separator as s:
     s.process_folder('path/to/input_file_or_folder')
 ```
 
+`model_type="auto"` detects the architecture from the YAML configuration using pymss-core. It supports explicit architecture declarations and recognized configurations for BS/Mel RoFormer and Conformer, HTDemucs, MDX23C, SCNet, Apollo, and Bandit v1/v2. BS PolarFormer uses `bs_roformer`; HyperACE is refined from checkpoint keys during loading. Unknown or ambiguous configurations raise `ModelTypeDetectionError` (a `RuntimeError` subclass) before weights are loaded; specify `model_type` manually in that case. VR and legacy models without YAML require an explicit type.
+
 ### Manual Constructor Parameters
 
 For a detailed explanation of every `MSSeparator` argument, see the [MSSeparator parameter guide](./docs/msseparator.md).
 
-- model_type: The type of model, e.g., 'htdemucs'. Must be one of 
+- model_type: Use 'auto' for YAML-based detection, or specify an architecture, e.g., 'htdemucs'. Explicit types include
     ['bs_roformer', 
     'bs_conformer',
     'mel_band_roformer', 
@@ -354,6 +356,8 @@ separator = MSSeparator.from_model_name(
 On Apple Silicon, `pyproject.toml` installs `mlx>=0.31.0` for this backend. If MLX is missing or a non-VR backend fails, the model records `_pymss_mlx_full_backend_error` and falls back to Torch MPS. Advanced users can still override `mps_model_backend` and `mps_model_compute_dtype` through `inference_params`.
 
 ### Model Compatibility
+
+BS PolarFormer checkpoints use `model_type="bs_roformer"` with `model.use_pope: true` in the matching YAML configuration. No separate PoPE or Triton package is required; MLX backend requests for these models fall back to PyTorch.
 
 HTDemucs checkpoints whose config uses `model: htdemucs` and `htdemucs.cac: true` are supported through `model_type='htdemucs'`.
 
