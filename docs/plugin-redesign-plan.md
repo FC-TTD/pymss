@@ -17,24 +17,24 @@
 
 ## 轮次
 
-### 第 1 轮：修复现有连接性缺陷（pymss）
+### 第 1 轮：修复现有连接性缺陷（pymss）✅ 已完成
 
-- [ ] 1.1 `register_builtin_codecs()` 改为幂等注册：已存在的同名 capability（无论 source）不覆盖；`supported_formats()` 枚举所有已注册 `{fmt}_encode`。
-- [ ] 1.2 新增 `ensure_plugins_loaded()`（loader）：惰性、幂等，供所有入口调用；`bootstrap()` 保持原语义。
-- [ ] 1.3 `cli.py main()` 在解析前加载用户插件，并把 `registry.cli_commands` 挂载为子命令（防冲突：与内置命令同名则跳过并告警）。
-- [ ] 1.4 业务入口接入插件加载：`cmd_infer`、`cmd_workflow_run`、`cmd_comfy_run`、`cmd_serve`（serve 在启动时一次）。
-- [ ] 1.5 回归测试：codec 覆盖场景、CLI 插件命令挂载、入口加载后外部 capability 可 require。
+- [x] 1.1 `register_builtin_codecs()` 幂等不覆盖；`supported_formats()` 枚举任意来源。已验证：插件覆盖 wav_encode 后3次 save_audio 仍生效并写出插件内容。
+- [x] 1.2 `ensure_plugins_loaded()`（loader）：惰性、幂等。
+- [x] 1.3 `cli.py main()` 加载用户插件并挂载 `cli_commands`（同名冲突跳过+告警）。e2e 验证 `pymss probe` 可执行。
+- [x] 1.4 `cmd_infer/cmd_workflow_run/cmd_comfy_run/cmd_serve` 接入。
+- [x] 1.5 修复 test_plugins autouse fixture 清空注册表不恢复内置注册导致的跨模块泄漏。
 
 验收：安装一个测试插件后，`pymss <plugin-cmd>` 可执行；`pymss infer` 路径中该插件的 capability 可被 require；外部 codec 覆盖在多次 save_audio 后仍生效。
 
-### 第 2 轮：Operation 模型 + runtime（pymss）
+### 第 2 轮：Operation 模型 + runtime（pymss）✅ 已完成
 
-- [ ] 2.1 新增 `pymss/pymss/operations/` 包：`OperationSpec`（id、schema_version、title、inputs、params JSON-Schema、outputs）、`OperationContext`（进度/取消/日志/工作目录）、`run(ctx, inputs, params)` 约定、结果为命名输出 dict。
-- [ ] 2.2 新增 `runtime.py`：`create_runtime()` 创建隔离实例（不用全局 _REGISTRY），注册/查询/校验/执行 operation；参数默认值填充与校验；operation id 冲突报错；插件 setup 失败回滚其注册。
-- [ ] 2.3 插件加载协议升级：插件模块可定义 `setup(plugin)`，通过 `plugin.register_operation()` 贡献操作；无 setup 的旧插件继续按 import 副作用注册（兼容）。
-- [ ] 2.4 loudnorm 改写为 setup() + Operation（在 pymss-plugins 仓库）。
-- [ ] 2.5 CLI 增加 `pymss ops list / ops run`（临时直跑入口，验证用）。
-- [ ] 2.6 测试：spec 校验、参数默认值/越界、冲突、回滚、ops run 端到端。
+- [x] 2.1 `pymss/operations/`：OperationSpec/OperationContext/Runtime（隔离实例、冲突报错、参数校验、setup 失败回滚）。
+- [x] 2.2 `create_runtime()` + `default_runtime()`；`PluginRegistration.register_operation` 桥接全局 loader。
+- [x] 2.3 插件 setup() 协议（round 1 已完成 loader 侧；本轮补 register_operation）。
+- [x] 2.5 CLI `pymss ops list/describe/run`。
+- [x] 2.6 测试：13 个单元测试 + ops CLI e2e 六场景。
+- [ ] 2.4 loudnorm 改写（在 pymss-plugins 仓库，随第 4 轮图适配一起验证）
 
 ### 第 3 轮：音频服务（decode/resample/channels/encode 走 Provider）
 
