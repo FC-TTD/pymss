@@ -50,13 +50,13 @@
 - [ ] 4.1 `run_dag()` 显式 runtime 参数（当前用 default_runtime，隔离宿主待 Studio 轮需要时加）
 - [ ] 4.4 旧 Comfy 工作流含 NormalizeLUFS 节点导入兼容测试
 
-### 第 5 轮：Studio 通用操作通道（pymss-studio）
+### 第 5 轮：Studio 通用操作通道（pymss-studio）✅ 核心完成（未含工作流编辑器动态节点）
 
-- [ ] 5.1 Python worker 新增命令：`list_operations` / `describe_operation` / `run_operation`（worker 用当前激活环境 import pymss 创建 runtime；音频传引用不传 PCM）。
-- [ ] 5.2 Rust：通用 run_operation 接入现有任务管理（start/cancel/终态事件），补通用终态事件类型（不硬编码命令名单）。
-- [ ] 5.3 前端：通用插件工具页（operationId 驱动表单：number/enum/bool/string/file）；结果通用展示（audio/file/text/table）；插件状态（加载失败/依赖缺失/可用）。
-- [ ] 5.4 工作流编辑器：从 describe_operation 动态生成 LiteGraph 节点（与工具页共享控件生成）；静态 nodeSpecs 缩为兼容映射。
-- [ ] 5.5 测试：worker 命令冒烟（tests/python）、前端 vitest、手动 tauri dev 验证 loudnorm 显示与执行。
+- [x] 5.1 Python worker：`list_operations`/`describe_operation`/`run_operation` 三命令 + 测试（含 loudnorm 归一化到 -18 LUFS e2e、缺输入失败路径、pymss 缺失降级）。
+- [x] 5.2 Rust：`start_operation_task`（后台任务）+ `list_operations`/`describe_operation`（one-shot）；`operation_result` 为终态事件（单测）。cargo check 通过。
+- [x] 5.3 前端：`plugin-ops` composable（发现/描述/后台执行/进度）+ 通用工具页 PluginOpsTool（文件输入/数值/枚举/开关/文本控件自动生成）+ 注册进工具列表 + 中英文 i18n。pnpm build 验证中。
+- [ ] 5.4 工作流编辑器动态节点（后续轮；当前静态 nodeSpecs 保持不变）
+- [ ] 5.5 tauri dev 手动验证（需 GUI 会话）
 
 ### 第 6 轮：Comfy 适配（comfy-mss）
 
