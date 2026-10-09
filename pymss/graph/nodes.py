@@ -212,10 +212,13 @@ def _has_config(separator: Any) -> bool:
 def _resample(audio: np.ndarray, source_sr: int, target_sr: int) -> np.ndarray:
     if source_sr == target_sr or audio.size == 0:
         return audio
-    # Share the file loader's PyAV/FFmpeg resampling through the built-in capability.
-    from ..plugins.builtins import resample
+    # Route through the audio service so a selected provider affects every
+    # graph resample path (model prep, ensemble alignment, save conversion).
+    # Default selection is the builtin PyAV implementation — byte-identical
+    # to the previous direct plugins.builtins.resample call.
+    from ..audio_services import default_audio_service
 
-    return resample(audio, source_sr, target_sr)
+    return default_audio_service().resample(audio, source_sr, target_sr)
 
 
 def _clean_model_display_name(value: str) -> str:
