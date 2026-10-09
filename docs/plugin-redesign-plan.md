@@ -43,12 +43,12 @@
 - [ ] 3.2 `audio_io.load_audio/save_audio` 委托音频服务（保留回退链）。
 - [ ] 3.4 长音频内存/帧数回归基准。
 
-### 第 4 轮：图执行器接入 runtime（pymss）
+### 第 4 轮：图执行器接入 runtime（pymss）✅ 核心完成
 
-- [ ] 4.1 `run_dag()`/`NodeContext` 接受 runtime 参数（默认惰性创建）。
-- [ ] 4.2 Operation 自动生成图节点：signature 由 OperationSpec 生成；执行时解析命名参数调用 `runtime.run()`；旧 `widgets_values` 读取移入导入适配层。
-- [ ] 4.3 旧节点 id 兼容：现有类型继续注册；新工作流保存 operation id + 命名参数 + schema_version。
-- [ ] 4.4 loudnorm 经图端到端测试：新格式节点执行 + 旧 Comfy 工作流导入后执行同一实现。
+- [x] 4.2 `operations/graph_bridge.py`：`register_operation_node()` 从 OperationSpec 自动生成图节点（`op.<id>` 命名；params 作为可选输入槽；执行读 `node.data['params']` 命名参数，widgets 仅在旧内置节点的导入适配层）。签名生成/命名参数执行/run_dag 全链路测试通过。
+- [x] 4.3 loudnorm（pymss-plugins 仓）改写为 setup()+Operation，保留 legacy 注册。图 e2e：3s 音频归一化到 LUFS -16.00 精确命中。
+- [ ] 4.1 `run_dag()` 显式 runtime 参数（当前用 default_runtime，隔离宿主待 Studio 轮需要时加）
+- [ ] 4.4 旧 Comfy 工作流含 NormalizeLUFS 节点导入兼容测试
 
 ### 第 5 轮：Studio 通用操作通道（pymss-studio）
 
