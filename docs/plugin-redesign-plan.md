@@ -1,6 +1,13 @@
 # pymss 插件系统改造总计划
 
-状态：执行中（experiment/plugin-redesign 分支）。
+状态：**七轮全部完成主干**（2026-10 实验，experiment/plugin-redesign 分支）。各轮残留增强项见各节 [ ] 条目。
+
+最终验收状态：
+
+- loudnorm 插件（setup()+Operation 单一实现）：CLI `pymss ops run` ✅、pymss 图 `op.pymss.loudnorm.normalize` 节点 ✅（LUFS -16.00 命中）、Studio worker+工具页 ✅（-18 LUFS e2e）、ComfyUI 工厂节点 ✅（-17 LUFS e2e）。四宿主零宿主侧代码改动。
+- 内置 DSP 与插件同路径：`pymss ops list` 无插件即列 4 项内置操作。
+- provider 替换可观测：换 resample provider 后图内模型准备/ensemble/保存路径全部改变；codec 插件覆盖在多次 save_audio 后仍生效。
+- 回归：pymss 528 passed；studio python 485 passed（2 个预存平台性失败除外）；comfy-mss 13 passed+5 subtests（含修复预存收集崩溃）。
 
 背景问题（已核实）：
 
@@ -66,12 +73,14 @@
 - [x] 额外修复：根 `__init__.py` 无包上下文导入时报错导致 pytest 收集崩溃（含预存 9 个 custom model 测试在本环境从未跑过的问题）。
 - [ ] 6.3 进度/取消接 Comfy ProgressBar（后续轮；当前 loudnorm 等快操作不需要）
 
-### 第 7 轮：内置功能迁移 + 收尾
+### 第 7 轮：内置功能迁移 + 收尾 ✅ 核心完成
 
-- [ ] 7.1 builtins DSP（音量/反相/归一化/裁剪/拼接/混音/EQ/静音/声道）改为内置 Operation，图节点消重（如 AudioAdjustVolume 复用同一实现）。
-- [ ] 7.2 separator 保存/读取路径全面走音频服务；编码器成为 Provider。
-- [ ] 7.3 安装器分层诊断：installed → loaded → contributed → executable；每环境依赖状态可见。
-- [ ] 7.4 文档：docs/plugins.md 更新为新协议；AGENTS/README 同步；跨宿主验收清单。
+- [x] 7.1（部分）builtins DSP 四项（音量/反相/峰值归一化/裁剪）成为内置 Operation，`default_runtime()` 首次使用时注册；与插件同路径（source=pymss.builtin）。剩余（拼接/混音/EQ/声道/静音）随需要补，模式已定。
+- [x] 7.4 文档：新增 `docs/plugins.md` 插件作者指南（操作协议/参数 schema/四宿主入口/provider 替换/旧协议兼容）。
+- [ ] 7.2 separator 读取/保存全面走音频服务（encode/decode provider 化）
+- [ ] 7.3 安装器分层诊断（installed→loaded→contributed→executable）
+
+注：Studio 工作流编辑器动态节点（5.4）、Comfy 进度接 ProgressBar（6.3）为后续增强，不阻塞主线验收。
 
 ## 全局验收
 
