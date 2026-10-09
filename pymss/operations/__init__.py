@@ -422,9 +422,13 @@ def default_runtime() -> Runtime:
 
     Distinct from ``create_runtime()`` instances: hosts that want isolation
     create their own; ``PluginRegistration.register_operation`` (the global
-    loader's setup handle) lands here.
+    loader's setup handle) lands here. The first call also registers the
+    built-in operations so every host gets them without extra wiring.
     """
     global _DEFAULT_RUNTIME
     if _DEFAULT_RUNTIME is None:
         _DEFAULT_RUNTIME = Runtime()
+        from .builtins import register_builtin_operations
+
+        register_builtin_operations()
     return _DEFAULT_RUNTIME
