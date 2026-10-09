@@ -376,6 +376,62 @@ def cmd_infer(args):
     return 0
 
 
+def cmd_ops(args):
+    """Handle ``pymss ops list|describe|run`` over the Operation runtime."""
+    from .operations import OperationContext, OperationError, default_runtime
+    from .plugins import ensure_plugins_loaded
+
+    # The global loader imports plugin modules; their setup() registers
+    # operations into the process default runtime. Using it here (instead of
+    # an isolated runtime) means each plugin loads exactly once per process.
+    ensure_plugins_loaded()
+    runtime = default_runtime()
+    cmd = getattr(args, "ops_command", None) or "list"
+
+    if cmd == "list":
+        ops = runtime.list_operations()
+        if not ops:
+            print("No operations registered (builtins arrive in round 7; plugins with setup() count).")
+            return 0
+        print(f"{len(ops)} operation(s):")
+        for op in ops:
+            print(f"  {op['id']}  v{op['schemaVersion']}  {op['title']}")
+        return 0
+
+    if cmd == "describe":
+        try:
+            spec = runtime.describe_operation(args.operation)
+        except OperationError as exc:
+            print(f"pymss ops describe: error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(spec, indent=2, ensure_ascii=False))
+        return 0
+
+    if cmd == "run":
+        params = _parse_key_value(args.param)
+        inputs = {}
+        for entry in args.input or []:
+            if "=" not in entry:
+                raise argparse.ArgumentTypeError(f"Expected name=path, got {entry!r}")
+            name, path = entry.split("=", 1)
+            inputs[name] = {"kind": "file", "path": path}
+        try:
+            result = runtime.run(
+                args.operation,
+                inputs=inputs,
+                params=params,
+                context=OperationContext(),
+            )
+        except OperationError as exc:
+            print(f"pymss ops run: error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+
+    print(f"pymss ops: unknown subcommand {cmd!r}", file=sys.stderr)
+    return 1
+
+
 def cmd_ensemble(args):
     """Run the ensemble CLI command.
 
@@ -950,6 +1006,34 @@ def build_parser():
     serve_parser.add_argument("--request-timeout-seconds", default=0.0, type=float)
     serve_parser.add_argument("--webui", action="store_true", help="Serve the optional browser WebUI at /ui/.")
     serve_parser.set_defaults(func=cmd_serve)
+
+    # ==========================
+    # Operations (round 2)
+    # ==========================
+    ops_parser = subparsers.add_parser(
+        "ops",
+        help="List, describe, and run registered operations.",
+        formatter_class=lambda prog: argparse.RawTextHelpFormatter(prog, max_help_position=60),
+    )
+    ops_subparsers = ops_parser.add_subparsers(dest="ops_command", required=False)
+    ops_subparsers.add_parser("list", help="List registered operations (default).")
+    describe_parser = ops_subparsers.add_parser("describe", help="Print one operation's spec as JSON.")
+    describe_parser.add_argument("operation", help="Operation id, e.g. pymss.loudnorm.normalize.")
+    run_parser = ops_subparsers.add_parser("run", help="Run an operation.")
+    run_parser.add_argument("operation", help="Operation id.")
+    run_parser.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        help="Named file input as name=path. Repeatable.",
+    )
+    run_parser.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        help="Parameter as key=value (bool/int/float parsed automatically).",
+    )
+    ops_parser.set_defaults(func=cmd_ops, ops_command="list")
 
     return parser
 

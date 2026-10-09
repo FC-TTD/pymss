@@ -199,6 +199,39 @@ class PluginRegistration:
 
     source: str
 
+    def register_operation(
+        self,
+        *,
+        id: str,
+        params: dict,
+        run: Callable[..., Any],
+        inputs: dict | None = None,
+        outputs: dict | None = None,
+        schema_version: int = 1,
+        title: str | None = None,
+        description: str = "",
+    ) -> None:
+        """Register an Operation into the global default runtime.
+
+        Convenience for plugins that only contribute operations; hosts with
+        their own Runtime instance call ``Runtime.register`` directly.
+        """
+        from ..operations import OperationSpec, default_runtime
+
+        default_runtime().register(
+            spec=OperationSpec(
+                id=id,
+                schema_version=schema_version,
+                title=title or id,
+                description=description,
+                inputs=inputs or {},
+                params=params,
+                outputs=outputs or {},
+            ),
+            run=run,
+            source=self.source,
+        )
+
     def register_capability(
         self,
         name: str,
