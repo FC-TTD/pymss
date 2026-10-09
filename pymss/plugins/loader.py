@@ -1,17 +1,14 @@
 """Plugin discovery and loading.
 
-Two discovery mechanisms (both use the same registration API):
-1. Folder scan (default, low-friction): each subdirectory of the plugins dir
-   is a plugin; we import its ``__init__.py`` (or ``plugin.py``).
+Two sources:
+1. Folder scan: every subdirectory of ``~/.pymss/plugins`` (or
+   ``$PYMSS_PLUGINS_DIR``) with an ``__init__.py`` or ``plugin.py``
+   is a plugin; we import it.
 2. Entry points (optional, for proper packages): packages declare
    ``[project.entry-points."pymss.plugins"]`` and we import the target module.
 
 A single plugin failing to load never blocks others: each import is wrapped in
 try/except, failures are recorded, and surfaced via ``pymss plugins list``.
-
-Plugin dir resolution order:
-  1. PYMSS_PLUGINS_DIR env var
-  2. ~/.pymss/plugins/
 """
 
 from __future__ import annotations
@@ -24,30 +21,32 @@ import sys
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PLUGINS_DIR = Path.home() / ".pymss" / "plugins"
 ENTRYPOINT_GROUP = "pymss.plugins"
+
+DEFAULT_PLUGINS_DIR = Path.home() / ".pymss" / "plugins"
 
 
 def get_plugins_dir() -> Path:
     """Resolve the plugins directory from env var or default."""
     env = os.environ.get("PYMSS_PLUGINS_DIR")
     if env:
-        return Path(env).expanduser()
+        return Path(env)
     return DEFAULT_PLUGINS_DIR
 
 
 @dataclass
 class PluginLoadResult:
-    """Record of a plugin load attempt (success or failure)."""
+    """Result of loading one plugin."""
 
     name: str
-    source: str  # "folder:<dir>" | "entrypoint" | "builtin"
+    source: str  # "folder:<path>" | "entrypoint"
     loaded: bool
-    error: str = ""
-    path: str = ""
+    error: str | None = None
+    path: str | None = None
 
 
 @dataclass
@@ -87,10 +86,35 @@ def _import_plugin_module(modname: str, path: Path | None) -> bool:
             raise ImportError(f"cannot load plugin module from {path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[modname] = module
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    else:
-        importlib.import_module(modname)
+        try:
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+        except Exception:
+            sys.modules.pop(modname, None)
+            raise
+        # Optional new-style protocol: a setup(plugin) function receives a
+        # registration handle and contributes operations/capabilities through
+        # it. Imported module side effects (old style) still work; setup()
+        # failures are raised so the loader can record the plugin as failed
+        # instead of silently half-registering.
+        _call_plugin_setup(module)
+        return True
+    imported = importlib.import_module(modname)
+    _call_plugin_setup(imported)
     return True
+
+
+def _call_plugin_setup(module: Any) -> None:
+    """Invoke an optional ``setup(plugin)`` hook on a plugin module.
+
+    The hook is optional (legacy import-side-effect plugins keep working).
+    Errors propagate to the caller so the plugin is reported as failed.
+    """
+    setup = getattr(module, "setup", None)
+    if setup is None:
+        return
+    from . import PluginRegistration
+
+    setup(PluginRegistration(source=module.__name__))
 
 
 def _scan_folder(plugins_dir: Path, report: PluginLoadReport) -> None:
@@ -174,7 +198,7 @@ def _scan_entrypoints(report: PluginLoadReport) -> None:
                     error=f"{type(exc).__name__}: {exc}",
                 )
             )
-            logger.warning("entrypoint plugin '%s' failed: load: %s", ep.name, exc)
+            logger.warning("entrypoint plugin '%s' failed to load: %s", ep.name, exc)
 
 
 def bootstrap(force: bool = False) -> PluginLoadReport:
@@ -194,6 +218,18 @@ def bootstrap(force: bool = False) -> PluginLoadReport:
     return report
 
 
+def ensure_plugins_loaded() -> PluginLoadReport:
+    """Load user plugins once per process before an entry point uses them.
+
+    Business entry points (infer / workflow / comfy run / serve / ops) call
+    this instead of ``bootstrap()`` directly: same idempotent semantics, but
+    named for "prepare the plugin state this process depends on" rather than
+    "produce a report for the plugins command". Failures are already isolated
+    per plugin; the report is retrievable via ``get_last_report()``.
+    """
+    return bootstrap()
+
+
 def reset() -> None:
     """Clear the cached bootstrap report (mainly for tests)."""
     global _LAST_REPORT
@@ -206,6 +242,7 @@ __all__ = [
     "PluginLoadResult",
     "PluginLoadReport",
     "bootstrap",
+    "ensure_plugins_loaded",
     "get_plugins_dir",
     "get_last_report",
     "reset",

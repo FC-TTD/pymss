@@ -188,6 +188,54 @@ class PluginRegistry:
 _REGISTRY: PluginRegistry = PluginRegistry()
 
 
+@dataclass(frozen=True)
+class PluginRegistration:
+    """Registration handle passed to a plugin's optional ``setup(plugin)``.
+
+    New-style plugins contribute through this object instead of importing
+    registration functions directly, so every registration is tagged with the
+    plugin's identity. The methods mirror the module-level API.
+    """
+
+    source: str
+
+    def register_capability(
+        self,
+        name: str,
+        func: Callable[..., Any],
+        *,
+        description: str = "",
+    ) -> None:
+        _REGISTRY.register_capability(
+            name, func, source=self.source, description=description
+        )
+
+    def register_node(
+        self,
+        node_type: str,
+        func: Callable[..., Any],
+        *,
+        description: str = "",
+        signature: Callable[..., Any] | None = None,
+    ) -> None:
+        _REGISTRY.register_node(
+            node_type, func, source=self.source, description=description,
+            signature=signature,
+        )
+
+    def register_cli(
+        self,
+        path: str | tuple[str, ...],
+        func: Callable[..., Any],
+        *,
+        help: str = "",
+        add_arguments: Callable[[Any], None] | None = None,
+    ) -> None:
+        _REGISTRY.register_cli(
+            path, func, help=help, source=self.source, add_arguments=add_arguments
+        )
+
+
 # ---------------------------------------------------------------------------
 # Public registration API (used by plugins via `from pymss.plugins import ...`)
 # ---------------------------------------------------------------------------

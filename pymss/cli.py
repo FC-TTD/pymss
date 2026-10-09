@@ -340,13 +340,10 @@ def _ensure_model_files(args):
 
 
 def cmd_infer(args):
-    """Implement the cmd infer helper.
+    """Run separation inference over an input file or folder."""
+    from .plugins import ensure_plugins_loaded
 
-    Args:
-        args (argparse.Namespace): Parsed command-line arguments.
-
-    Returns:
-        Any: Computed result."""
+    ensure_plugins_loaded()
     _ensure_model_files(args)
     logger = get_separation_logger()
     inference_progress = _CliInferenceProgress()
@@ -431,6 +428,9 @@ def cmd_workflow_validate(args):
 
 def cmd_workflow_run(args):
     """Run an audio workflow from a YAML/JSON file via the unified DAG core."""
+    from .plugins import ensure_plugins_loaded
+
+    ensure_plugins_loaded()
     from .graph import LegacyWorkflowRunner
 
     logger = get_separation_logger()
@@ -473,6 +473,9 @@ def _parse_named_inputs(values):
 
 def cmd_comfy_run(args):
     """Run a native comfy-mss JSON workflow via the DAG core."""
+    from .plugins import ensure_plugins_loaded
+
+    ensure_plugins_loaded()
     from .graph import load_comfy_file, run_dag
 
     logger = get_separation_logger()
@@ -505,13 +508,14 @@ def cmd_comfy_run(args):
 
 
 def cmd_serve(args):
-    """Implement the cmd serve helper.
+    """Start the OpenAI-style HTTP inference server."""
+    from .plugins import ensure_plugins_loaded
 
-    Args:
-        args (argparse.Namespace): Parsed command-line arguments.
+    # Load once at startup: plugins may provide codecs/capabilities used by
+    # later requests; per-request loading would be redundant (idempotent) but
+    # surfacing load failures at boot is the useful behavior.
+    ensure_plugins_loaded()
 
-    Returns:
-        Any: Computed result."""
     from .server import ServerConfig, run_server
 
     config = ServerConfig(
@@ -953,12 +957,18 @@ def build_parser():
 def main(argv=None):
     """Run the pymss command-line interface.
 
-    Args:
-        argv (Sequence[str] | None, optional): Command-line arguments. Uses sys.argv when None. Defaults to None.
+    Loads user plugins first so their registered CLI subcommands exist before
+    argument parsing, then mounts any plugin-registered commands that do not
+    collide with builtin subparsers.
+    """
+    from .plugins import ensure_plugins_loaded, get_registry
 
-    Returns:
-        int: Process exit code."""
     parser = build_parser()
+    try:
+        ensure_plugins_loaded()
+    except Exception as exc:  # noqa: BLE001 - plugin load errors must not kill the CLI
+        print(f"pymss: warning: plugin loading failed: {exc}", file=sys.stderr)
+    _mount_plugin_cli_commands(parser)
     args = parser.parse_args(argv)
     try:
         return args.func(args)
@@ -967,6 +977,60 @@ def main(argv=None):
         print(f"pymss error: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 1
+
+
+def _mount_plugin_cli_commands(parser) -> None:
+    """Attach registry.cli_commands as argparse subparsers.
+
+    A plugin command whose leading namespace collides with a builtin
+    subcommand is skipped with a warning instead of shadowing it. Plugin
+    commands are grouped under their source plugin in the help text.
+    """
+    from .plugins import get_registry
+
+    registry = get_registry()
+    if not registry.cli_commands:
+        return
+    # argparse exposes existing subparsers through _subparsers_action; the
+    # choices dict maps the top-level name to its subparser.
+    for action in getattr(parser, "_subparsers", None)._group_actions if getattr(parser, "_subparsers", None) else []:
+        subparsers = action
+        break
+    else:
+        return
+    existing = set(subparsers.choices)
+    for reg in registry.cli_commands:
+        if not reg.path:
+            continue
+        top, *rest = reg.path
+        if top in existing:
+            print(
+                f"pymss: warning: plugin '{reg.source}' command '{' '.join(reg.path)}' "
+                f"collides with builtin command '{top}'; skipped",
+                file=sys.stderr,
+            )
+            continue
+        sub = subparsers.add_parser(
+            top,
+            help=f"[plugin:{reg.source}] {reg.help}".strip(),
+        )
+        if reg.add_arguments is not None:
+            try:
+                reg.add_arguments(sub)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"pymss: warning: plugin '{reg.source}' add_arguments failed: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+        sub.set_defaults(func=reg.func)
+        existing.add(top)
+        if rest:
+            print(
+                f"pymss: warning: plugin '{reg.source}' command '{' '.join(reg.path)}' "
+                f"uses a multi-segment path; only '{top}' is exposed",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":

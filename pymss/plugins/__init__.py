@@ -22,12 +22,14 @@ from .loader import (
     PluginLoadReport,
     PluginLoadResult,
     bootstrap,
+    ensure_plugins_loaded,
     get_last_report,
     get_plugins_dir,
     reset,
 )
 from .registry import (
     CapabilityNotFound,
+    PluginRegistration,
     PluginRegistry,
     get_registry,
     register_capability,
@@ -45,6 +47,7 @@ __all__ = [
     "CapabilityNotFound",
     # discovery / loading (pymss core)
     "bootstrap",
+    "ensure_plugins_loaded",
     "get_plugins_dir",
     "get_last_report",
     "reset",
