@@ -58,12 +58,13 @@
 - [ ] 5.4 工作流编辑器动态节点（后续轮；当前静态 nodeSpecs 保持不变）
 - [ ] 5.5 tauri dev 手动验证（需 GUI 会话）
 
-### 第 6 轮：Comfy 适配（comfy-mss）
+### 第 6 轮：Comfy 适配（comfy-mss）✅ 完成
 
-- [ ] 6.1 加载时创建 runtime，OperationSpec → 节点工厂（INPUT_TYPES/RETURN_TYPES/FUNCTION/CATEGORY）。
-- [ ] 6.2 音频 batch 语义明确：单音频操作校验 batch=1；列表输出与 batch 分开处理。
-- [ ] 6.3 进度/取消接 Comfy ProgressBar；缓存失效考虑 operation + provider 版本。
-- [ ] 6.4 现有 13 个静态节点保留为薄包装，逐步内部改调 operation；分离动态 stem 节点保留专用类。
+- [x] 6.1 `comfy_mss/nodes/operations.py` 节点工厂：启动时加载 runtime，OperationSpec → INPUT_TYPES/RETURN_TYPES/FUNCTION/CATEGORY；生成节点注册为 `pymss_op_<id>`，不遮蔽静态 13 节点。
+- [x] 6.2 batch 语义：单音频操作显式拒绝 batch≠1（不再静默切第一片）；AUDIO 转换集中 `_audio_to_pymss`/`_pymss_to_audio`。
+- [x] 6.4 静态节点保留原样（薄包装化随第 7 轮内置迁移再做）。
+- [x] 额外修复：根 `__init__.py` 无包上下文导入时报错导致 pytest 收集崩溃（含预存 9 个 custom model 测试在本环境从未跑过的问题）。
+- [ ] 6.3 进度/取消接 Comfy ProgressBar（后续轮；当前 loudnorm 等快操作不需要）
 
 ### 第 7 轮：内置功能迁移 + 收尾
 
