@@ -38,10 +38,10 @@
 
 ### 第 3 轮：音频服务（decode/resample/channels/encode 走 Provider）
 
-- [ ] 3.1 定义 `AudioService` 接口：`probe/read/read_blocks/resample/convert_channels/encode/save`，Provider 显式登记多实现 + 显式选择（配置或任务级），记录"实际选中实现"。
-- [ ] 3.2 `audio_io.load_audio/save_audio` 委托音频服务；保留 PyAV→librosa→ffmpeg 回退链与解码重采样融合路径（行为不变，来源收拢）。
-- [ ] 3.3 图 `nodes.py` 的 `_resample`、`separator.py` 的标准化/归一化直接调用处改经 runtime 服务（保持算法与多 stem 共享增益语义）。
-- [ ] 3.4 测试：替换 resample provider 后图/CLI 保存路径确实改变；长音频内存/帧数回归（复用现有测试基线）。
+- [x] 3.1（resample 部分）`AudioService` 接口 + 显式 provider 选择 + 可观测 selected；`default_audio_service()` 进程惰性共享。已验证：图级换 provider 后模型准备/ensemble 对齐/保存转换路径确实改变。
+- [x] 3.3 图 `nodes.py` `_resample` 切入服务（默认 builtin 行为不变，byte-parity 测试）。encode/decode provider 化待第 7 轮随内置迁移一并做。
+- [ ] 3.2 `audio_io.load_audio/save_audio` 委托音频服务（保留回退链）。
+- [ ] 3.4 长音频内存/帧数回归基准。
 
 ### 第 4 轮：图执行器接入 runtime（pymss）
 
