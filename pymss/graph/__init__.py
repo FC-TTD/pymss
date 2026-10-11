@@ -18,6 +18,7 @@ from .core import (
     AudioArtifact,
     DAG,
     DAGError,
+    EXECUTION_EVENT_VERSION,
     DAGLink,
     DAGNode,
     DAGOutputRecord,
@@ -56,6 +57,7 @@ from .runner import LegacyWorkflowRunner
 
 __all__ = [
     "PROGRESS_EVENT_VERSION",
+    "EXECUTION_EVENT_VERSION",
     # artifacts
     "AudioArtifact",
     "StringArtifact",

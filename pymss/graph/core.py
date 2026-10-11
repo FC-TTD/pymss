@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,7 @@ import numpy as np
 from ..plugins.registry import _REGISTRY as _PLUGIN_REGISTRY
 
 PROGRESS_EVENT_VERSION = 1
+EXECUTION_EVENT_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -306,15 +308,41 @@ class NodeContext:
     node_index: int = 0
     node_count: int = 0
     _overall_fraction: float = 0.0
+    execution_event_callback: Callable[[dict[str, Any]], None] | None = None
+    _node_fraction: float = 0.0
+    _execution_callback_failed: bool = False
+
+    def _emit_execution_event(self, event_type: str, node: DAGNode | None = None,
+                              message: str = "", **details: Any) -> None:
+        if self.execution_event_callback is None:
+            return
+        event = {
+            "event": event_type, "version": EXECUTION_EVENT_VERSION,
+            "node_id": str(node.id) if node is not None else None,
+            "node_type": node.type if node is not None else None,
+            "node_fraction": self._node_fraction if node is not None else None,
+            "overall_fraction": self._overall_fraction,
+            "node_index": self.node_index if node is not None else None,
+            "node_count": self.node_count, "message": message,
+            **details,
+        }
+        self._execution_callback_failed = False
+        try:
+            self.execution_event_callback(event)
+        except BaseException:
+            # Observer errors abort the call, but are not node-execution errors.
+            self._execution_callback_failed = True
+            raise
 
     def report_progress(self, node: DAGNode, fraction: float, message: str, *,
                         audio_index: int | None = None, audio_count: int | None = None,
                         done: int | float | None = None, total: int | float | None = None,
-                        unit: str | None = None) -> None:
+                        unit: str | None = None, _event_type: str = "node_progress") -> None:
         """Report structured graph progress without changing legacy callbacks."""
-        if self.progress_event_callback is None:
+        if self.progress_event_callback is None and self.execution_event_callback is None:
             return
         fraction = min(1.0, max(0.0, fraction))
+        self._node_fraction = fraction
         self._overall_fraction = max(self._overall_fraction, (self.node_index + fraction) / max(1, self.node_count))
         event = {"node_id": str(node.id), "node_type": node.type, "overall_fraction": self._overall_fraction,
                  "node_fraction": fraction, "message": message}
@@ -322,7 +350,12 @@ class NodeContext:
             event.update(audio_index=audio_index, audio_count=audio_count)
         if done is not None and total is not None:
             event.update(done=done, total=total, unit=unit)
-        self.progress_event_callback(event)
+        if self.progress_event_callback is not None:
+            self.progress_event_callback(dict(event))
+        # A separate observer keeps lifecycle events out of the version-1
+        # progress stream, whose consumers may interpret fraction=1 as done.
+        self._emit_execution_event(_event_type, node, **{key: value for key, value in event.items()
+                                                       if key not in {"node_id", "node_type"}})
 
     def require(self, capability_name: str) -> Callable[..., Any]:
         """Look up a capability by name (delegates to the plugin registry)."""
@@ -639,14 +672,19 @@ def run_dag(
     audio_params: dict[str, Any] | None = None,
     separator_cache: SeparatorCache | None = None,
     name_prefix: str = "",
+    execution_event_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[str]:
-    """Execute a DAG and return the list of files written by output nodes."""
-    _load_builtin_nodes()
+    """Execute a DAG and return saved paths.
+
+    ``execution_event_callback`` observes lifecycle events independently of
+    legacy progress callbacks. Execution failures and interruptions still
+    propagate to the caller.
+    """
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
 
     owns_cache = separator_cache is None
-    cache = separator_cache or SeparatorCache()
+    cache = separator_cache if separator_cache is not None else SeparatorCache()
+    ctx: NodeContext | None = None
     try:
         ctx = NodeContext(
             output_dir=output_path,
@@ -667,8 +705,13 @@ def run_dag(
             nodes_by_id={node.id: node for node in dag.nodes},
             name_prefix=name_prefix or "",
             progress_event_callback=progress_event_callback,
+            execution_event_callback=execution_event_callback,
+            node_count=len(dag.nodes),
         )
 
+        ctx._emit_execution_event("execution_started")
+        _load_builtin_nodes()
+        output_path.mkdir(parents=True, exist_ok=True)
         order = topological_order(dag.nodes)
         total = len(order)
         ctx.node_count = total
@@ -678,6 +721,8 @@ def run_dag(
 
         for index, node in enumerate(order):
             ctx.node_index = index
+            ctx.current_node_id = node.id
+            ctx._node_fraction = 0.0
             if (
                 not node.signature.inputs
                 and not node.signature.output_names
@@ -698,7 +743,8 @@ def run_dag(
                         )
                     if progress_callback is not None:
                         progress_callback(index + 1, total, f"node={node.id} skipped unknown")
-                    ctx.report_progress(node, 1.0, f"node={node.id} skipped unknown")
+                    ctx.current_node_id = None
+                    ctx.report_progress(node, 1.0, f"node={node.id} skipped unknown", _event_type="node_skipped")
                     continue
                 raise
 
@@ -728,19 +774,36 @@ def run_dag(
 
             if progress_callback is not None:
                 progress_callback(index, total, f"node={node.id} type={node.type}")
-            ctx.report_progress(node, 0.0, f"node={node.id} type={node.type}")
+            ctx.report_progress(node, 0.0, f"node={node.id} type={node.type}", _event_type="node_started")
 
-            ctx.current_node_id = node.id
             result = node_info.execute(ctx, gathered)
             results[node.id] = result
             saved.extend(result.saved_paths)
             all_records.extend(result.saved_records)
 
+            ctx.current_node_id = None
             if progress_callback is not None:
                 progress_callback(index + 1, total, f"node={node.id} type={node.type}")
-            ctx.report_progress(node, 1.0, f"node={node.id} type={node.type}")
+            ctx.report_progress(node, 1.0, f"node={node.id} type={node.type}", _event_type="node_completed")
 
+        ctx._overall_fraction = 1.0
+        ctx._emit_execution_event("execution_completed")
         return DAGExecutionResult(saved, records=all_records)
+    except BaseException as exc:
+        if ctx is not None and ctx.execution_event_callback is not None and not ctx._execution_callback_failed:
+            node = ctx.nodes_by_id.get(ctx.current_node_id) if ctx.current_node_id is not None else None
+            status = "cancelled" if isinstance(exc, (KeyboardInterrupt, AsyncCancelledError)) else "failed"
+            try:
+                if node is not None:
+                    ctx._emit_execution_event(f"node_{status}", node, str(exc), error_type=type(exc).__name__)
+                ctx._emit_execution_event(f"execution_{status}", node, str(exc), error_type=type(exc).__name__)
+            except BaseException as notification_error:
+                # Keep the original exception and any explicit cause. The
+                # observer failure is retained as its exception context.
+                if notification_error is exc:
+                    raise
+                raise exc
+        raise
     finally:
         if owns_cache:
             cache.close()
