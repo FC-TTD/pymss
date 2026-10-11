@@ -135,6 +135,41 @@ pymss comfy run -c workflow.json \
 
 所有 comfy-mss 节点（`pymss_load_audio`、`pymss_mss_separate`、`pymss_audio_ensemble`、`pymss_save_audio` 等）和 ComfyUI 核心音频节点（`SaveAudio`/`SaveAudioMP3`/`SaveAudioOpus`/`SaveAudioAdvanced`、`AudioMerge`、`AudioConcat`、`TrimAudioDuration`、`SplitAudioChannels`/`JoinAudioChannels`、`AudioAdjustVolume`、`EmptyAudio`、`AudioEqualizer3Band`、`PreviewAudio`、`LoadAudio`）都已支持。节点执行器消费内置能力而不是重写 DSP，因此同一套 `eq`/`mix`/`ensemble`/`{fmt}_encode` 能力同时支撑 CLI、Python API 和工作流节点。加 `--no-strict` 可以在遇到未知节点时警告并跳过，而不是报错。
 
+### 图执行事件（Python API）
+
+宿主程序可以订阅执行状态，无需向 ComfyUI 工作流添加字段，也不改变节点参数：
+
+```python
+from pymss.graph import load_comfy_file, run_dag
+
+def on_event(event):
+    print(event["event"], event["node_id"], event["node_fraction"])
+
+outputs = run_dag(
+    load_comfy_file("workflow.json"),
+    output_dir="results",
+    execution_event_callback=on_event,
+)
+```
+
+`EXECUTION_EVENT_VERSION = 1` 表示这个可选同步回调接口的版本。它独立于 ComfyUI 的 WebSocket 通信协议：ComfyUI 的 `executed` 表示节点返回了界面更新，而这里的 `node_completed` 明确表示该节点执行完成。宿主程序负责将事件接入自己的显示或通信层。JSON 解析发生在 `run_dag` 之前，解析错误仍由加载器直接抛出。已有 `progress_callback`、`progress_event_callback` 和 `PROGRESS_EVENT_VERSION` 保持原有约定。
+
+| 事件 | 含义 |
+| --- | --- |
+| `execution_started`、`execution_completed` | 图执行开始或成功结束，空 DAG 同样有完整事件。 |
+| `node_started`、`node_completed` | 节点开始执行或成功返回。 |
+| `node_progress` | 中间进度；比例为 1 可能只表示某个音频处理完成，不代表整个节点完成。 |
+| `node_failed`、`execution_failed` | 执行失败，原始异常仍向调用方抛出。 |
+| `node_cancelled`、`execution_cancelled` | 执行被 `KeyboardInterrupt` 或 `asyncio.CancelledError` 中断；中断仍向调用方抛出。 |
+| `node_skipped` | 调用方明确指定 `strict=False` 后跳过了未知节点。 |
+
+每个事件包含 `event`、`version`、`message`、`node_count` 和 `overall_fraction`。关联节点的事件还包含字符串形式的 `node_id`、`node_type`、从 0 开始的 `node_index` 和 `node_fraction`；未关联节点时这四项为 `None`。进度事件可包含从 1 开始的 `audio_index`、`audio_count`、`done`、`total`、`unit`。失败和取消事件包含 `error_type`，图级失败在能确定节点时也携带节点信息。图结构校验失败不会虚构执行节点；输入解析失败可能先于 `node_started` 产生 `node_failed`。
+
+- 取消事件记录执行期间抛出的中断，取消方式由宿主程序控制；强制结束进程无法发送最终回调。已经写出的文件会保留。
+- 回调应及时返回。`run_dag` 会抛出执行事件回调自身的异常，并清理本次执行拥有的分离器缓存；不会再次向这个出错的回调发送节点失败事件。如果回调在接收执行失败事件时又抛出异常，原始执行异常及其显式原因保持不变，回调异常保留在 `__context__` 中。
+- 事件接口不改变默认只缓存一个模型的限制；调用方传入的 `SeparatorCache` 仍由调用方负责关闭。
+- `LegacyWorkflowRunner` 同样接受 `execution_event_callback`，并为事件补充 `track`。即使指定 `continue_on_error=True`，`KeyboardInterrupt` 和 `asyncio.CancelledError` 仍会终止整个文件夹任务。
+
 ### CLI Ensemble
 
 ```sh
