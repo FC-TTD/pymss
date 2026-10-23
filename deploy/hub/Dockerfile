@@ -13,6 +13,29 @@ RUN python -c 'import re,sys; assert all(re.fullmatch(r".+@sha256:[a-f0-9]{64}",
 # Copying a new directory merges files, so remove only this build-time staging.
 RUN rm -rf /tmp/hub-runtime-wheel
 COPY --from=runtime_package /opt/hub-runtime-wheel /tmp/hub-runtime-wheel
+# pip uninstall renames inherited directories, which this base's overlay rejects.
+# Remove only the SDK's exclusive package and metadata, then install normally.
+RUN python - <<'PY'
+import importlib.metadata as metadata
+from pathlib import Path
+import shutil
+import sysconfig
+
+distribution = metadata.distribution('ttd-model-runtime')
+site = Path(sysconfig.get_path('purelib')).resolve()
+package = site / 'ttd_model_runtime'
+info = Path(distribution._path)
+assert distribution.metadata['Name'] == 'ttd-model-runtime'
+assert info == site / f'ttd_model_runtime-{distribution.version}.dist-info'
+assert package.resolve() == package and info.resolve() == info
+assert all(Path(item).parts[0] in {package.name, info.name} and '..' not in Path(item).parts
+           for item in distribution.files)
+for other in metadata.distributions():
+    if other.metadata['Name'] != 'ttd-model-runtime':
+        assert not any(Path(item).parts[0] == package.name for item in other.files or ())
+shutil.rmtree(package)
+shutil.rmtree(info)
+PY
 RUN python -m pip install --no-deps --no-cache-dir /tmp/hub-runtime-wheel/*.whl
 # Install the new core before copying frequently changing application source.
 # Keep the pinned base's CUDA stack and administrator WebUI.
