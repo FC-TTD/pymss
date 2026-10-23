@@ -64,6 +64,7 @@ def test_load_and_separate_fake_model_over_live_http(fake_loader, live_client_fa
                     "data": base64.b64encode(raw).decode("ascii"),
                 },
                 "stems": ["vocals"],
+                "output_audio_format": "pcm_f32le",
             },
         )
         assert separation.status_code == 200

@@ -13,7 +13,7 @@ from time import time
 from tqdm import tqdm
 
 from .audio_io import load_audio, save_audio
-from .utils import clear_mlx_cache, demix, get_model_from_config
+from .utils import _resolve_use_amp, clear_mlx_cache, demix, get_model_from_config
 from .logger import get_separation_logger, set_log_level
 from .config import AttrDict
 
@@ -35,6 +35,7 @@ INFERENCE_PARAM_TARGETS = {
     "cuda_attention_backend": "inference",
     "mps_attention_backend": "inference",
     "mps_mlx_min_tokens": "inference",
+    "mps_mlx_clear_cache": "inference",
     "mps_model_backend": "inference",
     "mps_model_compute_dtype": "inference",
     "fuse_conv_bn": "inference",
@@ -55,6 +56,7 @@ PASSTHROUGH_INFERENCE_PARAMS = frozenset(
         "use_amp",
         "cuda_attention_backend",
         "mps_attention_backend",
+        "mps_mlx_clear_cache",
         "mps_model_backend",
         "mps_model_compute_dtype",
         "fuse_conv_bn",
@@ -70,7 +72,13 @@ class _AdamW8bitCheckpointStub:
 
 _AdamW8bitCheckpointStub.__module__ = "bitsandbytes.optim.adamw"
 _AdamW8bitCheckpointStub.__qualname__ = "AdamW8bit"
-FAST_INIT_MODEL_TYPES = {"bs_roformer", "bs_roformer_hyperace", "mel_band_roformer"}
+FAST_INIT_MODEL_TYPES = {
+    "bs_roformer",
+    "bs_roformer_hyperace",
+    "bs_conformer",
+    "mel_band_roformer",
+    "mel_band_conformer",
+}
 LEGACY_DEMUCS_MODEL_TYPES = {"demucs", "tasnet", "legacy_demucs", "legacy_tasnet"}
 OUTPUT_NORMALIZE_TARGET_DBFS = -0.01
 OUTPUT_NORMALIZE_PEAK = 10 ** (OUTPUT_NORMALIZE_TARGET_DBFS / 20)
@@ -93,10 +101,16 @@ def _resolve_public_device(device, inference_params, logger):
             raise RuntimeError("device='mlx' requires Apple Silicon MPS support")
         inference_params.setdefault("mps_model_backend", "mlx_full")
         inference_params.setdefault("mps_model_compute_dtype", "float16")
+        inference_params.setdefault("mps_mlx_clear_cache", True)
         logger.debug("Mapping device='mlx' to device='mps' with MLX full model backend")
         return "mps", inference_params
+    if requested_device == "rocm":
+        if not torch.cuda.is_available():
+            raise RuntimeError("device='rocm' requires a ROCm-enabled PyTorch build with a visible HIP device")
+        logger.debug("Mapping device='rocm' to device='cuda' (ROCm PyTorch exposes HIP devices as cuda)")
+        return "cuda", inference_params
     if requested_device not in {"auto", "cpu", "cuda", "mps"}:
-        raise ValueError("device must be 'auto', 'cpu', 'cuda', 'mps', or 'mlx'")
+        raise ValueError("device must be 'auto', 'cpu', 'cuda', 'mps', 'rocm', or 'mlx'")
     return requested_device, inference_params
 
 
@@ -112,7 +126,10 @@ def _select_device(device, device_ids, logger):
         Any: Computed result."""
     if device not in ["cpu", "cuda", "mps"]:
         if torch.cuda.is_available():
-            logger.debug("CUDA is available in Torch, setting Torch device to CUDA")
+            if getattr(torch.version, "hip", None):
+                logger.debug("ROCm/HIP device is available in Torch, setting Torch device to CUDA device (backed by ROCm)")
+            else:
+                logger.debug("CUDA is available in Torch, setting Torch device to CUDA")
             return f"cuda:{device_ids[0]}"
         if torch.backends.mps.is_available():
             logger.debug("Apple Silicon MPS/CoreML is available in Torch, setting Torch device to MPS")
@@ -139,7 +156,10 @@ def _prefer_mlx_for_auto(requested_device, selected_device, inference_params, lo
         if "mps_model_backend" not in inference_params:
             inference_params["mps_model_backend"] = "mlx_full"
             inference_params.setdefault("mps_model_compute_dtype", "float16")
+            inference_params.setdefault("mps_mlx_clear_cache", True)
             logger.debug("Auto device selected MPS, enabling MLX full model backend")
+        elif inference_params.get("mps_model_backend") == "mlx_full":
+            inference_params.setdefault("mps_mlx_clear_cache", True)
     return inference_params
 
 
@@ -443,6 +463,17 @@ def _coerce_mps_float64(module):
                 child._buffers[name] = buffer.float()
 
 
+def _coerce_cpu_low_precision(module):
+    """Run CPU inference in float32 when checkpoints store fp16/bf16 weights."""
+    for child in module.modules():
+        for name, param in list(child._parameters.items()):
+            if param is not None and param.dtype in {torch.float16, torch.bfloat16}:
+                child._parameters[name] = torch.nn.Parameter(param.detach().float(), requires_grad=param.requires_grad)
+        for name, buffer in list(child._buffers.items()):
+            if buffer is not None and buffer.dtype in {torch.float16, torch.bfloat16}:
+                child._buffers[name] = buffer.float()
+
+
 def _model_is_stereo(model_type, config):
     """Implement the model is stereo helper.
 
@@ -454,7 +485,14 @@ def _model_is_stereo(model_type, config):
         Any: Computed result."""
     if model_type == "vr":
         return True
-    if model_type in ["bs_roformer", "bs_roformer_hyperace", "mel_band_roformer", *LEGACY_DEMUCS_MODEL_TYPES]:
+    if model_type in [
+        "bs_roformer",
+        "bs_roformer_hyperace",
+        "bs_conformer",
+        "mel_band_roformer",
+        "mel_band_conformer",
+        *LEGACY_DEMUCS_MODEL_TYPES,
+    ]:
         return config.model.get("stereo", True)
     return True
 
@@ -469,16 +507,27 @@ def _prepare_mix_channels(mix, is_stereo, logger):
 
     Returns:
         Any: Computed result."""
+    from .plugins.builtins import to_mono
+
     if is_stereo and len(mix.shape) == 1:
-        logger.warning("Track is mono, but model is stereo, adding a second channel.")
+        if logger:
+            logger.warning("Track is mono, but model is stereo, adding a second channel.")
         return np.stack([mix, mix], axis=0)
+    if is_stereo and len(mix.shape) == 2 and mix.shape[0] == 1:
+        # [1, N] channel-first mono (e.g. graph AudioArtifact normalizes 1-D
+        # arrays to [1, N]) — duplicate the channel for stereo models.
+        if logger:
+            logger.warning("Track is mono, but model is stereo, adding a second channel.")
+        return np.concatenate([mix, mix], axis=0)
     if is_stereo and len(mix.shape) > 2:
         logger.warning("Track has more than 2 channels, taking mean of all channels and adding a second channel.")
-        mono = np.mean(mix, axis=0)
+        mono = to_mono(mix)
         return np.stack([mono, mono], axis=0)
-    if not is_stereo and len(mix.shape) != 1:
-        logger.warning("Track has more than 1 channels, but model is mono, taking mean of all channels.")
-        return np.mean(mix, axis=0)
+    if not is_stereo:
+        if len(mix.shape) != 1:
+            logger.warning("Track has more than 1 channels, but model is mono, taking mean of all channels.")
+            return to_mono(mix)[None, :]
+        return mix[None, :]
     return mix
 
 
@@ -495,11 +544,12 @@ def _standardize_mix(mix, enabled, logger):
     if not enabled:
         return mix, None
 
-    mono = mix.mean(0)
-    mean = mono.mean()
-    std = mono.std()
+    from .plugins.builtins import standardize
+
+    standardized, stats = standardize(mix)
+    mean, std = stats
     logger.debug(f"Standardize mix with mean: {mean}, std: {std}")
-    return (mix - mean) / std, (mean, std)
+    return standardized, stats
 
 
 def _normalize_outputs(results, enabled, logger, target_peak=OUTPUT_NORMALIZE_PEAK):
@@ -516,6 +566,8 @@ def _normalize_outputs(results, enabled, logger, target_peak=OUTPUT_NORMALIZE_PE
     if not enabled:
         return results
 
+    from .plugins.builtins import normalize_peak
+
     peak = max(
         (float(np.max(np.abs(np.asarray(audio)))) for audio in results.values() if np.asarray(audio).size),
         default=0.0,
@@ -524,9 +576,8 @@ def _normalize_outputs(results, enabled, logger, target_peak=OUTPUT_NORMALIZE_PE
         logger.debug("Skipping output normalize because peak is zero or not finite.")
         return results
 
-    gain = target_peak / peak
-    logger.debug(f"Normalize output stems with peak: {peak}, target_peak: {target_peak}, gain: {gain}")
-    return {stem: np.asarray(audio) * gain for stem, audio in results.items()}
+    logger.debug(f"Normalize output stems with peak: {peak}, target_peak: {target_peak}")
+    return {stem: normalize_peak(audio, target_peak=target_peak) for stem, audio in results.items()}
 
 
 def _destandardize(estimates, stats):
@@ -538,7 +589,11 @@ def _destandardize(estimates, stats):
 
     Returns:
         Any: Computed result."""
-    return estimates if stats is None else estimates * stats[1] + stats[0]
+    if stats is None:
+        return estimates
+    from .plugins.builtins import destandardize
+
+    return destandardize(estimates, stats)
 
 
 def _tta_variants(mix, use_tta, logger):
@@ -658,6 +713,43 @@ def _get_store_dir(store_dirs, instr):
     return ""
 
 
+def _as_store_path(value):
+    """Return a filesystem path value as a string, or None for unsupported values."""
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _iter_store_paths(value):
+    """Yield filesystem paths from one ``store_dirs`` value."""
+    if isinstance(value, list):
+        for item in value:
+            path = _as_store_path(item)
+            if path:
+                yield path
+        return
+
+    path = _as_store_path(value)
+    if path:
+        yield path
+
+
+def _has_single_store_folder(store_dirs):
+    """Return whether ``store_dirs`` routes saved stems to one folder."""
+    if _as_store_path(store_dirs):
+        return True
+    if not isinstance(store_dirs, dict):
+        return False
+
+    folders = set()
+    for value in store_dirs.values():
+        paths = list(_iter_store_paths(value))
+        if not paths:
+            return False
+        folders.update(os.path.normcase(os.path.abspath(path)) for path in paths)
+    return len(folders) == 1
+
+
 class MSSeparator:
     """Load a music source separation model and run inference.
 
@@ -668,9 +760,10 @@ class MSSeparator:
 
     Args:
         model_type (str): Model architecture/runtime type. Common values
-            include ``bs_roformer``, ``mel_band_roformer``, ``htdemucs``,
-            ``mdx23c``, ``bandit``, ``bandit_v2``, ``scnet``, ``apollo``,
-            ``vr``, ``legacy_demucs``, and ``legacy_tasnet``.
+            include ``bs_roformer``, ``bs_conformer``, ``mel_band_roformer``,
+            ``mel_band_conformer``, ``htdemucs``, ``mdx23c``, ``bandit``,
+            ``bandit_v2``, ``scnet``, ``apollo``, ``vr``, ``legacy_demucs``,
+            and ``legacy_tasnet``.
         model_path (str | os.PathLike): Path to the model weights file, such
             as a ``.ckpt``, ``.th``, ``.pth``, or VR model file.
         config_path (str | os.PathLike | None, optional): YAML config path for
@@ -678,8 +771,10 @@ class MSSeparator:
             VR models use built-in metadata instead of an MSS YAML config.
             Defaults to None.
         device (str, optional): Runtime device. Valid values are ``auto``,
-            ``cpu``, ``cuda``, ``mps``, and ``mlx``. ``auto`` chooses CUDA
-            first, then Apple MPS, then CPU. ``mlx`` is a public shortcut for
+            ``cpu``, ``cuda``, ``rocm``, ``mps``, and ``mlx``. ``auto`` chooses CUDA
+            first, then Apple MPS, then CPU. ``rocm`` is a public shortcut for
+            AMD ROCm GPUs and maps to the ``cuda`` device path (ROCm PyTorch
+            exposes HIP devices as ``cuda``). ``mlx`` is a public shortcut for
             Apple Silicon MLX execution through the MPS device path. Defaults
             to ``"auto"``.
         device_ids (list[int], optional): CUDA device IDs. Multiple IDs can
@@ -695,6 +790,9 @@ class MSSeparator:
             string writes every saved stem to the same folder. A dict maps stem
             names to a folder, a list of folders, ``None``, or an empty value.
             Missing/empty values skip that stem. Defaults to ``"results"``.
+        save_as_folder (bool, optional): When True and ``store_dirs`` resolves
+            to one output folder, each input audio file is saved into its own
+            subfolder named after the input audio basename. Defaults to False.
         audio_params (dict, optional): Encoding options used only when writing
             files, for example ``wav_bit_depth``, ``flac_bit_depth``,
             ``mp3_bit_rate``, ``m4a_bit_rate``, ``m4a_codec``, and
@@ -705,7 +803,9 @@ class MSSeparator:
             progress-bar behavior. Defaults to False.
         progress_callback (callable | None, optional): Optional callback used
             by lower-level demixing code. It receives progress information
-            during long-running inference. Defaults to None.
+            during long-running inference. Demix progress is reported as
+            ``callback(done_seconds, total_seconds, message)``. Defaults to
+            None.
         inference_params (dict, optional): Runtime inference overrides. Common
             keys include ``batch_size``, ``overlap_size``, ``chunk_size``,
             ``stem_batch_size``, ``standardize``, ``normalize``, ``mask_mode``,
@@ -746,6 +846,7 @@ class MSSeparator:
         output_format="wav",
         use_tta=False,
         store_dirs="results",  # str for single folder, dict with instrument keys for multiple folders
+        save_as_folder=False,
         audio_params={
             "wav_bit_depth": "FLOAT",
             "flac_bit_depth": "PCM_24",
@@ -776,7 +877,7 @@ class MSSeparator:
             config_path (str | os.PathLike | None, optional): YAML config path.
                 If omitted, pymss tries ``model_path + ".yaml"``. Defaults to
                 None.
-            device (str, optional): ``auto``, ``cpu``, ``cuda``, ``mps``, or
+            device (str, optional): ``auto``, ``cpu``, ``cuda``, ``rocm``, ``mps``, or
                 ``mlx``. Defaults to ``"auto"``.
             device_ids (list[int], optional): CUDA device IDs used when CUDA
                 and DataParallel are available. Defaults to ``[0]``.
@@ -788,6 +889,10 @@ class MSSeparator:
                 For example ``"results"`` saves all stems to one folder, while
                 ``{"vocals": "out/vocals", "drums": None}`` saves only
                 vocals and skips drums. Defaults to ``"results"``.
+            save_as_folder (bool, optional): If True and ``store_dirs`` is a
+                single folder path, or every saved dict destination resolves to
+                the same folder, ``process_folder()`` writes each input file's
+                stems under ``<output>/<audio_name>/``. Defaults to False.
             audio_params (dict, optional): Encoder settings. Examples:
                 ``{"wav_bit_depth": "FLOAT"}``,
                 ``{"flac_bit_depth": "PCM_24"}``,
@@ -798,7 +903,9 @@ class MSSeparator:
             debug (bool, optional): Enables verbose debug logging. Defaults to
                 False.
             progress_callback (callable | None, optional): Progress callback
-                passed into demixing helpers. Defaults to None.
+                passed into demixing helpers. Demix progress is reported as
+                ``callback(done_seconds, total_seconds, message)``. Defaults
+                to None.
             inference_params (dict, optional): Inference overrides. ``None``
                 values keep model config defaults. ``standardize`` controls
                 legacy input standardization, and ``normalize`` controls linked
@@ -830,6 +937,7 @@ class MSSeparator:
         self.output_format = output_format
         self.use_tta = use_tta
         self.store_dirs = store_dirs
+        self.save_as_folder = save_as_folder
         self.audio_params = audio_params
         self.logger = logger
         self.debug = debug
@@ -849,6 +957,7 @@ class MSSeparator:
         self.device = _select_device(device, self.device_ids, self.logger)
         self.inference_params = _prefer_mlx_for_auto(device, self.device, self.inference_params, self.logger)
 
+        self._cudnn_benchmark_initial = torch.backends.cudnn.benchmark
         torch.backends.cudnn.benchmark = True
         self.logger.info(f"Using device: {self.device}, device_ids: {self.device_ids}")
 
@@ -863,6 +972,8 @@ class MSSeparator:
                 self.store_dirs.pop(key)
                 self.logger.warning(f"Invalid instrument key: {key}, removing from store_dirs")
                 self.logger.warning(f"Valid instrument keys: {self.config.training.instruments}")
+
+        self.save_as_folder = bool(self.save_as_folder and _has_single_store_folder(self.store_dirs))
 
     def __enter__(self):
         """Return the loaded separator when entering a ``with`` block.
@@ -901,21 +1012,23 @@ class MSSeparator:
 
     @classmethod
     def from_model_name(cls, model_name, model_dir=None, download=False, source="modelscope", endpoint=None, **kwargs):
-        """Create a separator from a model catalog name or alias.
+        """Create a separator from a catalog or user-registered model name.
 
         This resolves the model type, weights path, config path, and auxiliary
-        files from the pymss model catalog, then forwards remaining keyword
-        arguments to ``MSSeparator(...)``.
+        files from the pymss model catalog or local user registry, then forwards
+        remaining keyword arguments to ``MSSeparator(...)``.
 
         Args:
-            model_name (str): Catalog model name or alias, for example
-                ``"bs_roformer_voc_hyperacev2"``.
+            model_name (str): Catalog model name/alias or a name previously
+                registered with ``register_model`` / ``pymss register``.
             model_dir (str | os.PathLike | None, optional): Directory used to
-                find or download model files. Uses the default pymss cache when
-                omitted. Defaults to None.
-            download (bool, optional): If True, missing model files are
-                downloaded before loading. If False, missing files raise
-                ``FileNotFoundError``. Defaults to False.
+                find or download catalog model files. Uses the default pymss
+                cache when omitted. Ignored for user-registered models that
+                already store absolute paths. Defaults to None.
+            download (bool, optional): If True, missing catalog model files are
+                downloaded before loading. Ignored for user-registered models.
+                If False, missing files raise ``FileNotFoundError``. Defaults to
+                False.
             source (str, optional): Download source passed to the downloader:
                 ``modelscope``, ``huggingface``, or ``hf-mirror``. Defaults to
                 ``"modelscope"``.
@@ -923,7 +1036,8 @@ class MSSeparator:
                 endpoint. Defaults to None.
             **kwargs: Extra arguments forwarded to ``MSSeparator(...)``, such
                 as ``device``, ``output_format``, ``store_dirs``,
-                ``audio_params``, ``debug``, and ``inference_params``.
+                ``save_as_folder``, ``audio_params``, ``debug``, and
+                ``inference_params``.
 
         Returns:
             MSSeparator: Loaded separator instance.
@@ -937,14 +1051,22 @@ class MSSeparator:
             ...     output_format="flac",
             ...     inference_params={"normalize": True},
             ... )"""
-        if download:
+        from .model_registry import resolve_model
+
+        preview = resolve_model(model_name, model_dir=model_dir, require_supported=True, require_exists=False)
+        if download and preview.get("source") != "user":
             from .model_download import download_model
 
             download_model(model_name, model_dir=model_dir, source=source, endpoint=endpoint)
 
-        from .model_registry import resolve_model
-
         resolved = resolve_model(model_name, model_dir=model_dir, require_supported=True, require_exists=True)
+        kwargs = dict(kwargs)
+        from .model_registry import _merge_resolved_inference_params
+
+        kwargs["inference_params"] = _merge_resolved_inference_params(
+            resolved,
+            kwargs.pop("inference_params", None),
+        )
         return cls(
             model_type=resolved["model_type"],
             model_path=resolved["model_path"],
@@ -1071,6 +1193,10 @@ class MSSeparator:
         model_kwargs_override = None
         if model_type == "mel_band_roformer":
             model_kwargs_override = _infer_mel_band_roformer_model_kwargs(state_dict)
+        elif model_type == "mel_band_conformer":
+            model_kwargs_override = {
+                "mlp_hidden_layers": _infer_mel_band_roformer_mlp_hidden_layers(state_dict),
+            }
 
         init_context = _skip_torch_default_init() if model_type in FAST_INIT_MODEL_TYPES else nullcontext()
         with init_context:
@@ -1088,6 +1214,8 @@ class MSSeparator:
             model.load_state_dict(state_dict)
         if torch.device(self.device).type == "mps":
             _coerce_mps_float64(model)
+        if torch.device(self.device).type == "cpu":
+            _coerce_cpu_low_precision(model)
 
         keep_torch_model_cpu = _store_torch_model_on_cpu_for_mlx(config, self.device)
         if len(self.device_ids) > 1 and not keep_torch_model_cpu:
@@ -1113,7 +1241,7 @@ class MSSeparator:
             None: Model settings are written to the logger."""
         config_path_part = f", config_path: {config_path}" if include_config_path else ""
         self.logger.info(
-            f"Separator params: model_type: {model_type}, model_path: {self.model_path}{config_path_part}, output_folder: {self.store_dirs}"
+            f"Separator params: model_type: {model_type}, model_path: {self.model_path}{config_path_part}, output_folder: {self.store_dirs}, save_as_folder: {self.save_as_folder}"
         )
         self.logger.info(f"Audio params: output_format: {self.output_format}, audio_params: {self.audio_params}")
         self.logger.info(
@@ -1131,10 +1259,10 @@ class MSSeparator:
             )
         else:
             self.logger.info(
-                f"MSS model params: chunk_size: {config.inference.get('chunk_size', None)}, overlap_size: {config.inference.get('overlap_size', None)}, stem_batch_size: {config.inference.get('stem_batch_size', None)}"
+                f"MSS model params: chunk_size: {config.audio.get('chunk_size', config.inference.get('chunk_size', None))}, overlap_size: {config.inference.get('overlap_size', None)}, stem_batch_size: {config.inference.get('stem_batch_size', None)}"
             )
             self.logger.debug(
-                f"MSS model params: mask_mode: {config.inference.get('mask_mode', None)}, cuda_attention_backend: {config.inference.get('cuda_attention_backend', None)}, mps_attention_backend: {config.inference.get('mps_attention_backend', None)}, mps_mlx_min_tokens: {config.inference.get('mps_mlx_min_tokens', None)}, mps_model_backend: {config.inference.get('mps_model_backend', None)}, mps_model_compute_dtype: {config.inference.get('mps_model_compute_dtype', None)}"
+                f"MSS model params: use_amp: {_resolve_use_amp(config)}, mask_mode: {config.inference.get('mask_mode', None)}, cuda_attention_backend: {config.inference.get('cuda_attention_backend', None)}, mps_attention_backend: {config.inference.get('mps_attention_backend', None)}, mps_mlx_min_tokens: {config.inference.get('mps_mlx_min_tokens', None)}, mps_model_backend: {config.inference.get('mps_model_backend', None)}, mps_model_compute_dtype: {config.inference.get('mps_model_compute_dtype', None)}"
             )
 
     def apply_model_inference_config(self, model, config):
@@ -1151,7 +1279,7 @@ class MSSeparator:
         Returns:
             None: Supported options are applied directly to model modules."""
         if hasattr(model, "set_mask_mode"):
-            model.set_mask_mode(config.inference.get("mask_mode", "no_segm"))
+            model.set_mask_mode(config.inference.get("mask_mode", "full"))
         cuda_attention_backend = config.inference.get("cuda_attention_backend", None)
         if cuda_attention_backend is not None:
             for module in model.modules():
@@ -1215,6 +1343,14 @@ class MSSeparator:
             if key not in PASSTHROUGH_INFERENCE_PARAMS:
                 value = float(value) if key in {"post_process_threshold", "overlap"} else int(value)
             config[section][key] = value
+
+        from .utils import apply_msst_inference_compat
+
+        apply_msst_inference_compat(
+            config,
+            logger=self.logger,
+            user_set_chunk_size=params.get("chunk_size") is not None,
+        )
         return config
 
     def _save_output(self, instr, audio, sr, file_name, save_dir):
@@ -1225,7 +1361,8 @@ class MSSeparator:
             audio (np.ndarray): Stem audio samples.
             sr (int): Sample rate.
             file_name (str): Base input filename without extension.
-            save_dir (str | os.PathLike): Destination directory.
+            save_dir (str): Destination directory. When ``save_as_folder`` is
+                active, this is already the per-input audio subfolder.
 
         Returns:
             None: The stem is written to disk."""
@@ -1233,6 +1370,18 @@ class MSSeparator:
         os.makedirs(save_dir, exist_ok=True)
         self.save_audio(audio, sr, f"{file_name}_{instr}", save_dir)
         self.logger.debug(f"Saved {instr} for {file_name}_{instr}.{output_format} in {save_dir}")
+
+    def _resolve_output_dir(self, save_dir, file_name):
+        """Return the final folder used for one input audio file.
+
+        Args:
+            save_dir (str): Configured output directory.
+            file_name (str): Base input filename without extension.
+
+        Returns:
+            str: Configured directory, or a per-audio subfolder when
+            ``save_as_folder`` is active."""
+        return os.path.join(save_dir, file_name) if self.save_as_folder else save_dir
 
     def _wait_save_futures(self, path, futures):
         """Wait for asynchronous save jobs and report failures.
@@ -1275,7 +1424,9 @@ class MSSeparator:
             save_executor (ThreadPoolExecutor): Executor used for file writes.
             results (dict[str, np.ndarray]): Mapping of stem name to audio.
             sr (int): Sample rate.
-            file_name (str): Base input filename without extension.
+            file_name (str): Base input filename without extension. Also used
+                as the per-input output folder name when ``save_as_folder`` is
+                active.
 
         Returns:
             list[concurrent.futures.Future]: Save job futures."""
@@ -1284,7 +1435,8 @@ class MSSeparator:
             for instr, audio in results.items()
             for save_dir in [_get_store_dir(self.store_dirs, instr)]
             if save_dir
-            for output_dir in (save_dir if isinstance(save_dir, list) else [save_dir])
+            for configured_output_dir in (save_dir if isinstance(save_dir, list) else [save_dir])
+            for output_dir in [self._resolve_output_dir(configured_output_dir, file_name)]
         ]
 
     def _stems_to_save(self):
@@ -1387,6 +1539,8 @@ class MSSeparator:
         Notes:
             ``store_dirs`` controls which stems are saved. If only ``vocals``
             and ``drums`` are routed, only those stems are requested and saved.
+            When ``save_as_folder=True`` and all saved stems share one output
+            folder, stems for ``song.wav`` are written under ``<output>/song/``.
             With output ``normalize=True``, those selected stems share one peak
             normalization gain."""
         if os.path.isfile(input_folder):
@@ -1592,10 +1746,30 @@ class MSSeparator:
                 except Exception as exc:
                     self.logger.debug(f"Could not move model to CPU during close: {exc}")
         finally:
+            self._restore_cudnn_benchmark()
             self.model = None
             self.config = None
             self.store_dirs = {}
             self.del_cache()
+
+    def _restore_cudnn_benchmark(self):
+        """Restore ``torch.backends.cudnn.benchmark`` to its pre-init value.
+
+        Args:
+            None: This callable does not accept user-provided arguments.
+
+        Returns:
+            None: When the separator captured an initial ``cudnn.benchmark``
+            value during initialization, the global flag is restored to that
+            value so downstream modules observe the same state as before
+            pymss ran."""
+        initial = getattr(self, "_cudnn_benchmark_initial", None)
+        if initial is None:
+            return
+        try:
+            torch.backends.cudnn.benchmark = initial
+        except Exception as exc:
+            self.logger.debug(f"Could not restore torch.backends.cudnn.benchmark: {exc}")
 
     def del_cache(self):
         """Run garbage collection and clear accelerator memory caches.

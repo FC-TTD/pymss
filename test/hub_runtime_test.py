@@ -22,6 +22,7 @@ from ttd_model_runtime.runtime import Runtime
 
 from hub_runtime.__main__ import create_app, describe
 from hub_runtime.native import NativeBackend, describe_loaded
+from hub_batch.provider import ModelCoordinator, SharedModel
 from hub_runtime.server_app import _load_or_switch_model, _run_separation
 from hub_runtime.state import metadata_from_dict
 
@@ -75,6 +76,9 @@ class FakeRuntime:
 
     def _nested(self):
         return False
+
+    def pending_work(self):
+        return 0
 
     def get(self):
         assert _owned.get()
@@ -200,6 +204,15 @@ class ManagedHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((audio.samplerate, audio.subtype, audio.channels),
                          (48000, "PCM_24", 2))
 
+    async def test_missing_config_requests_explicit_load_without_gpu_work(self):
+        self.state.loaded.instruments = ()
+        status, body = await self.separate()
+        self.assertEqual(status, 503)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["code"], "model_not_loaded")
+        self.assertIn("/v1/models/load", error["message"])
+        self.assertEqual(self.runtime.engine.calls, [])
+
     async def test_native_limit_rejects_second_request_without_new_activity(self):
         self.runtime.engine.release = threading.Event()
         first = asyncio.create_task(self.separate())
@@ -307,6 +320,39 @@ class NativeBoundaryTests(unittest.TestCase):
             self.assertEqual(len(built), 2)
             backend.close()
             self.assertTrue(built[1].separator.closed)
+
+    def test_coordinated_native_backend_removes_runtime_only_concurrency_field(self):
+        class Separator:
+            model_type = "bs_roformer"
+
+            def separate(self, mix, pbar=False, stems=None):
+                return {stem: mix for stem in (stems or ["vocals"])}
+
+        seen = []
+
+        def factory(**kwargs):
+            seen.append(dict(kwargs))
+            return SharedModel(Separator(), metadata(kwargs["model"]))
+
+        coordinator = ModelCoordinator(factory)
+        backend = NativeBackend(coordinator=coordinator)
+        spec = {
+            "model": MODEL, "model_dir": "/models", "source": "hf-mirror",
+            "endpoint": None, "inference_params": {}, "max_concurrency": 3,
+        }
+        try:
+            # NativeBackend supplies its native factory explicitly to the
+            # coordinator. Patch that boundary so this CPU test never downloads.
+            with patch.object(backend, "_native_factory", side_effect=factory):
+                desc, results = backend.separate(spec, np.zeros(16), ["vocals"])
+            self.assertEqual(desc["model_id"], MODEL)
+            self.assertIn("vocals", results)
+            self.assertEqual(seen, [{
+                "model": MODEL, "model_dir": "/models", "source": "hf-mirror",
+                "endpoint": None, "inference_params": {},
+            }])
+        finally:
+            coordinator.close()
 
     def test_actual_sdk_child_roundtrip_and_acknowledged_release(self):
         from ttd_model_runtime.engine import ProcessModel

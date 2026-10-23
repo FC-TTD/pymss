@@ -1,0 +1,151 @@
+{
+  "version": 0.4,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "input_audio",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "pymss_mss_params",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "params",
+          "type": "MSS_PARAMS"
+        }
+      ],
+      "widgets_values": [
+        1,
+        "24255",
+        "485100",
+        false,
+        false,
+        false
+      ]
+    },
+    {
+      "id": 3,
+      "type": "mss_separate",
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 1
+        },
+        {
+          "name": "params",
+          "type": "MSS_PARAMS",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Vocals (Audio)",
+          "type": "AUDIO"
+        },
+        {
+          "name": "Vocals (String)",
+          "type": "STRING"
+        },
+        {
+          "name": "Instrumental (Audio)",
+          "type": "AUDIO"
+        },
+        {
+          "name": "Instrumental (String)",
+          "type": "STRING"
+        }
+      ],
+      "widgets_values": [
+        "melband_roformer_instvox_duality_v2.ckpt",
+        "cuda",
+        true,
+        "huggingface",
+        "0",
+        false
+      ]
+    },
+    {
+      "id": 4,
+      "type": "pymss_save_audio",
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "widgets_values": [
+        "wav",
+        "dialogue",
+        "48000",
+        "PCM_24",
+        "PCM_24",
+        "320k"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "pymss_save_audio",
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 4
+        }
+      ],
+      "outputs": [],
+      "widgets_values": [
+        "wav",
+        "me",
+        "48000",
+        "PCM_24",
+        "PCM_24",
+        "320k"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      3,
+      0,
+      "AUDIO"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      1,
+      "MSS_PARAMS"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "AUDIO"
+    ],
+    [
+      4,
+      3,
+      2,
+      5,
+      0,
+      "AUDIO"
+    ]
+  ]
+}

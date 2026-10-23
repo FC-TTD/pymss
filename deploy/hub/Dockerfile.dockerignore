@@ -2,6 +2,16 @@
 !hub_runtime
 !hub_runtime/**
 hub_runtime/**/__pycache__
+!hub_batch
+!hub_batch/**
+hub_batch/**/__pycache__
 !deploy
 !deploy/hub
 !deploy/hub/Dockerfile
+!pyproject.toml
+!README.md
+!LICENSE
+!pymss
+!pymss/**
+pymss/**/__pycache__
+pymss/**/*.pyc

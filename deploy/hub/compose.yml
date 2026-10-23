@@ -21,6 +21,9 @@ services:
       PYMSS_MODEL_DIR: /models
       PYMSS_HUB_INITIAL_MODEL: BS-Roformer-Resurrection.ckpt
       PYMSS_DOWNLOAD_SOURCE: hf-mirror
+      PYMSS_BATCH_INPUT_ROOT: /TTD/04_应用/pymss/GATEWAY_INPUTS
+      PYMSS_BATCH_OUTPUT_ROOT: /TTD/04_应用/pymss/GATEWAY_TASKS
+      PYMSS_BATCH_STATE_DIR: /TTD/04_应用/pymss/GATEWAY_TASKS/state
       TZ: Asia/Shanghai
     extra_hosts: ['host.docker.internal:host-gateway']
     ports: ['127.0.0.1:13921:18083']
@@ -28,6 +31,7 @@ services:
       - /opt/ttd-hub-v2/runtime-state/pymss:/var/lib/hub-runtime
       - /TTD-Data/pymss/models:/models
       - /TTD-Data/pymss/outputs:/outputs
+      - /TTD/04_应用/pymss:/TTD/04_应用/pymss
     deploy:
       resources:
         reservations:
@@ -45,7 +49,7 @@ services:
     container_name: pymss-hub-entry
     restart: unless-stopped
     entrypoint: [/usr/local/bin/model-entry]
-    command: [--upstream, 'http://runtime:8000', --listen, ':7860']
+    command: [--upstream, 'http://runtime:8000', --listen, ':7860', --admission-path, /v1/audio/separations, --admission-path, /v1/models/load, --admission-path, /v1/separations, --admission-path, /v1/batches]
     networks: [model, caddy]
     labels:
       ttd.hub.release: ${PYMSS_RELEASE:?}

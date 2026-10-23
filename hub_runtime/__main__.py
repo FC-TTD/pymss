@@ -4,6 +4,7 @@ import os
 import sys
 
 from .adapter import load_model, completion, cleanup, release
+from hub_batch.profiles import default_profiles
 
 
 def server_config():
@@ -27,14 +28,28 @@ def server_config():
     )
 
 
-def create_app(runtime=None, config=None):
+def _provider_jobs(runtime):
+    from hub_batch.jobs import Jobs
+    input_root = os.getenv("PYMSS_BATCH_INPUT_ROOT")
+    output_root = os.getenv("PYMSS_BATCH_OUTPUT_ROOT")
+    state_dir = os.getenv("PYMSS_BATCH_STATE_DIR")
+    if not input_root or not output_root or not state_dir:
+        return None
+    return Jobs(runtime, state_dir, input_root, output_root, profile_registry=default_profiles())
+
+
+def create_app(runtime=None, config=None, jobs=None):
     from fastapi.responses import RedirectResponse
     from ttd_model_runtime import Runtime
     from ttd_model_runtime.integrations.fastapi import attach
     from .server_app import build_app
     runtime = runtime or Runtime(load_model, completion=completion, cleanup=cleanup,
                                  release=release, gpu_process=True, execution_timeout=None)
-    app = build_app(config or server_config(), runtime)
+    jobs = jobs if jobs is not None else _provider_jobs(runtime)
+    if jobs is not None:
+        runtime.pending_work = jobs.store.pending
+    app = build_app(config or server_config(), runtime, jobs=jobs,
+                    profile_registry=getattr(jobs, "profile_registry", None))
 
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():

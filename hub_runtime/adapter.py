@@ -5,8 +5,9 @@ def load_model():
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("Managed PYMSS requires its assigned CUDA GPU")
-    from .native import NativeBackend
-    return NativeBackend()
+    from .native import UnifiedBackend
+    import os
+    return UnifiedBackend(os.environ.get("PYMSS_MODEL_DIR", "/models"))
 
 
 def completion(model):

@@ -1,5 +1,6 @@
 import math
 import os
+from importlib.resources import files
 from pathlib import Path
 
 import numpy as np
@@ -8,13 +9,37 @@ from torch import nn
 from torch.nn.utils.fusion import fuse_conv_bn_eval
 from tqdm import tqdm
 
+from pymss_core.modules.vocal_remover import ModelParameters, determine_model_capacity
+from pymss_core.modules.vocal_remover.uvr_lib_v5.vr_network import nets_new
+
 from .common_separator import CommonSeparator
 from .uvr_lib_v5 import spec_utils
-from .uvr_lib_v5.vr_network import nets, nets_new
-from .uvr_lib_v5.vr_network.model_param_init import ModelParameters
 
 
-VR_PARAMS_DIR = Path(__file__).resolve().parents[2] / "resources" / "vr_modelparams"
+class _ResourceDir:
+    def __init__(self, package):
+        self._root = files(package)
+
+    def __truediv__(self, name):
+        return self._root / name
+
+    def exists(self):
+        return self._root.is_dir()
+
+    def is_dir(self):
+        return self._root.is_dir()
+
+    def iterdir(self):
+        return self._root.iterdir()
+
+    def __str__(self):
+        return str(self._root)
+
+    def __repr__(self):
+        return repr(self._root)
+
+
+VR_PARAMS_DIR = _ResourceDir("pymss_core.resources.vr_modelparams")
 
 
 def _fuse_sequential_conv_bn(module):
@@ -61,7 +86,7 @@ class VRSeparator(CommonSeparator):
             self.is_vr_51_model = True
 
         params_path = VR_PARAMS_DIR / f"{self.model_data['vr_model_param']}.json"
-        if not params_path.exists():
+        if not params_path.is_file():
             raise FileNotFoundError(f"VR model parameter file not found: {params_path}")
         self.model_params = ModelParameters(str(params_path))
 
@@ -148,7 +173,7 @@ class VRSeparator(CommonSeparator):
             )
             self.is_vr_51_model = True
         else:
-            self.model_run = nets.determine_model_capacity(self.model_params.param["bins"] * 2, nn_arch_size)
+            self.model_run = determine_model_capacity(self.model_params.param["bins"] * 2, nn_arch_size)
 
         try:
             state_dict = torch.load(self.model_path, map_location="cpu", weights_only=True)
@@ -289,17 +314,19 @@ class VRSeparator(CommonSeparator):
 
                 mask_batches = []
                 for i in process_batches:
-                    pred = self._predict_mask_mlx(torch.from_numpy(x_dataset[i : i + self.batch_size]))
+                    batch_count = min(self.batch_size, patches - i)
+                    pred = self._predict_mask_mlx(torch.from_numpy(x_dataset[i : i + batch_count]))
                     pred = pred.astype(mx.float32).transpose(1, 2, 0, 3).reshape(pred.shape[1], pred.shape[2], -1)
                     mask_batches.append(pred)
                     write_pos += pred.shape[2]
                     if self.progress_callback:
-                        self.progress_callback(min(i + self.batch_size, patches), patches, "Processing VR batches")
+                        self.progress_callback(i + batch_count, patches, "Processing VR batches")
                 return mx.concatenate(mask_batches, axis=2)[:, :, :write_pos]
 
             with torch.inference_mode():
                 for i in process_batches:
-                    x_batch_cpu = torch.from_numpy(x_dataset[i : i + self.batch_size])
+                    batch_count = min(self.batch_size, patches - i)
+                    x_batch_cpu = torch.from_numpy(x_dataset[i : i + batch_count])
                     x_batch = (
                         x_batch_cpu.to(device=device, non_blocking=True, memory_format=torch.channels_last)
                         if self.use_channels_last
@@ -321,7 +348,7 @@ class VRSeparator(CommonSeparator):
                     mask[:, :, write_pos : write_pos + pred.size(2)] = pred
                     write_pos += pred.size(2)
                     if self.progress_callback:
-                        self.progress_callback(min(i + self.batch_size, patches), patches, "Processing VR batches")
+                        self.progress_callback(i + batch_count, patches, "Processing VR batches")
             return mask[:, :, :write_pos]
 
         def adjust_aggr_torch(mask, is_non_accom_stem):

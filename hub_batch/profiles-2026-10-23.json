@@ -1,0 +1,587 @@
+{
+  "profiles": [
+    {
+      "name": "dialogue-vocal",
+      "version": "2026-10-23.v1",
+      "dag": "dialogue-vocal-2026-10-23-v1",
+      "outputs": [
+        "Vocals",
+        "Instrumental"
+      ],
+      "models": [
+        "melband_roformer_instvox_duality_v2.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {},
+      "implementation": {
+        "dag_sha256": "c7c4a6247c99d3aab8e77f68345f97ba9106a42c51af17090e9b973b7b791a84",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "melband_roformer_instvox_duality_v2.ckpt",
+            "relpath": "vocal/vocal_instrumental_dual/melband_roformer_instvox_duality_v2.ckpt",
+            "sha256": "b4a69558708f2857e36ac86a0e03ed95c4e3d8b9c5b8113963987d0d7df7e20f",
+            "size_bytes": 1719116358
+          },
+          {
+            "kind": "config",
+            "model": "melband_roformer_instvox_duality_v2.ckpt",
+            "relpath": "vocal/vocal_instrumental_dual/melband_roformer_instvox_duality_v2.yaml",
+            "sha256": "0e2eee6184bee6eda469d35d19e798f1fe428aebbb1efc6086a5d64db5eb0e53",
+            "size_bytes": 917
+          }
+        ]
+      },
+      "output_roles": [
+        {
+          "native_stem": "Vocals",
+          "role": "vocals",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "Instrumental",
+          "role": "instrumental",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2
+      }
+    },
+    {
+      "name": "dialogue-vocal-b",
+      "version": "2026-10-23.v1",
+      "dag": "dialogue-vocal-b-2026-10-23-v1",
+      "outputs": [
+        "vocals",
+        "other"
+      ],
+      "models": [
+        "mel_band_roformer_vocals_becruily.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {},
+      "implementation": {
+        "dag_sha256": "d002725d012038932f331a8f8e0d294da688cc43971aef1bb191c31e1b831961",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "mel_band_roformer_vocals_becruily.ckpt",
+            "relpath": "vocal/vocal_extraction/mel_band_roformer_vocals_becruily.ckpt",
+            "sha256": "a05961310cc55fbb901290c2e8be02682942f73522b6ac76bf2ec11e347ed95a",
+            "size_bytes": 913107578
+          },
+          {
+            "kind": "config",
+            "model": "mel_band_roformer_vocals_becruily.ckpt",
+            "relpath": "vocal/vocal_extraction/mel_band_roformer_vocals_becruily.yaml",
+            "sha256": "a3799cefc73358ca3b6f4838f10f26cdc78c1f39eadc28092df7bdb4a3d1ef33",
+            "size_bytes": 1729
+          }
+        ]
+      },
+      "output_roles": [
+        {
+          "native_stem": "vocals",
+          "role": "vocals",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "other",
+          "role": "instrumental",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2
+      }
+    },
+    {
+      "name": "instrumental-quality",
+      "version": "2026-10-23.v1",
+      "dag": "instrumental-quality-2026-10-23-v1",
+      "outputs": [
+        "vocals",
+        "other"
+      ],
+      "models": [
+        "big_beta5e.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {},
+      "implementation": {
+        "dag_sha256": "e16aca7ae69aab62b7145529c66e1f029618c7878d1443ef9b2471f152cc303c",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "big_beta5e.ckpt",
+            "relpath": "vocal/vocal_extraction/big_beta5e.ckpt",
+            "sha256": "32b876e1163716a9a007438b5a5107069586aa9b9ca653a5f63013b1edf6920c",
+            "size_bytes": 1479749810
+          },
+          {
+            "kind": "config",
+            "model": "big_beta5e.ckpt",
+            "relpath": "vocal/vocal_extraction/big_beta5e.yaml",
+            "sha256": "e7632669bc0d83b2026d8b5f51b2ac8696bf9ac7a4cc72b9e4a2e017dcb619bb",
+            "size_bytes": 913
+          }
+        ]
+      },
+      "output_roles": [
+        {
+          "native_stem": "vocals",
+          "role": "vocals",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "other",
+          "role": "instrumental",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2
+      }
+    },
+    {
+      "name": "instrumental-separation",
+      "version": "2026-10-23.v1",
+      "dag": "instrumental-separation-2026-10-23-v1",
+      "outputs": [
+        "Instrumental",
+        "Vocals"
+      ],
+      "models": [
+        "mel_band_roformer_instrumental_becruily.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {},
+      "implementation": {
+        "dag_sha256": "d56f5e08131922f66bbc9d60481ab0d21d7433bf6d9a980c2741a1ca94243e04",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "mel_band_roformer_instrumental_becruily.ckpt",
+            "relpath": "instrumental/mel_band_roformer_instrumental_becruily.ckpt",
+            "sha256": "a8da6632a1c25efb1c9be783ce9ea367d226d4b918cd6c3717c8b1d7a396041d",
+            "size_bytes": 913106900
+          },
+          {
+            "kind": "config",
+            "model": "mel_band_roformer_instrumental_becruily.ckpt",
+            "relpath": "instrumental/mel_band_roformer_instrumental_becruily.yaml",
+            "sha256": "a71083f7767ae742130418cc0966cf658bd7af1d4cc76f1bd65dbe12272e2db3",
+            "size_bytes": 1742
+          }
+        ]
+      },
+      "output_roles": [
+        {
+          "native_stem": "Instrumental",
+          "role": "instrumental",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "Vocals",
+          "role": "vocals",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2
+      }
+    },
+    {
+      "name": "male-female",
+      "version": "2026-10-23.v1",
+      "dag": "male-female-2026-10-23-v1",
+      "outputs": [
+        "male",
+        "female"
+      ],
+      "models": [
+        "bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {},
+      "implementation": {
+        "dag_sha256": "a4cecaf9e0c005549bbe45e5af62cbaf04cc69914ff1b6c913ae1929e143b1d1",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt",
+            "relpath": "vocal/vocal_gender_chorus/bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt",
+            "sha256": "3cf11736d1b42a11ae55d8299316585921477dd2a671b24b663660846ca9861b",
+            "size_bytes": 527119779
+          },
+          {
+            "kind": "config",
+            "model": "bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt",
+            "relpath": "vocal/vocal_gender_chorus/bs_roformer_male_female_by_aufr33_sdr_7.2889.yaml",
+            "sha256": "aeec5af39ef64fb30cb445305e778d73e073bdb710e057ce11cc1240bfb79b4e",
+            "size_bytes": 1870
+          }
+        ]
+      },
+      "output_roles": [
+        {
+          "native_stem": "male",
+          "role": "male",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "female",
+          "role": "female",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2
+      }
+    },
+    {
+      "name": "dereverb",
+      "version": "2026-10-23.v1",
+      "dag": "dereverb-2026-10-23-v1",
+      "outputs": [
+        "noreverb",
+        "reverb"
+      ],
+      "models": [
+        "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {},
+      "implementation": {
+        "dag_sha256": "1c54ef8477ecaa20e5e496f691796f618bf4fc6b178a8b693b1f5a08d557f16c",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
+            "relpath": "reverb_echo_control/dereverb/dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
+            "sha256": "9262877b87e9ebb0fb808a456b0a411fa677f5df31c8383c1254af531c078970",
+            "size_bytes": 913107578
+          },
+          {
+            "kind": "config",
+            "model": "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
+            "relpath": "reverb_echo_control/dereverb/dereverb_mel_band_roformer_anvuew_sdr_19.1729.yaml",
+            "sha256": "f0e3353ac6f9214239f506684d70c045135d3e51170fdca4dec72b3c0fac4b69",
+            "size_bytes": 1869
+          }
+        ]
+      },
+      "output_roles": [
+        {
+          "native_stem": "noreverb",
+          "role": "dry-vocal",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "reverb",
+          "role": "reverb",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2
+      }
+    },
+    {
+      "name": "fx",
+      "version": "2026-10-23.v1",
+      "dag": "fx-2026-10-23-v1",
+      "outputs": [
+        "Speech",
+        "Music",
+        "Effects"
+      ],
+      "models": [
+        "model_bandit_plus_dnr_sdr_11.47.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {},
+      "implementation": {
+        "dag_sha256": "a9090937c55bb5146809ce3568d2da431a84f247fbd44e4f4878804da85d2bac",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "model_bandit_plus_dnr_sdr_11.47.ckpt",
+            "relpath": "music_stems/dnr_stems/model_bandit_plus_dnr_sdr_11.47.ckpt",
+            "sha256": "c48284779f7d1258a6527d3aaa18a532d45c1f506e2dcc25d5ab179a8c5e2573",
+            "size_bytes": 148891175
+          },
+          {
+            "kind": "config",
+            "model": "model_bandit_plus_dnr_sdr_11.47.ckpt",
+            "relpath": "music_stems/dnr_stems/model_bandit_plus_dnr_sdr_11.47.yaml",
+            "sha256": "5594404dbad97fb0a0e6f349653e3555d3b5da752d00cd5eebb6cc90961fcc16",
+            "size_bytes": 2024
+          }
+        ],
+        "source": {
+          "url": "https://huggingface.co/Sucial/MSST-WebUI/resolve/90b617b15bd0dc0b784f3d361faca1b51173fe44/All_Models/multi_stem_models/model_bandit_plus_dnr_sdr_11.47.chpt",
+          "upstream_name": "model_bandit_plus_dnr_sdr_11.47.chpt"
+        }
+      },
+      "output_roles": [
+        {
+          "native_stem": "Speech",
+          "role": "dialogue",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "Music",
+          "role": "music",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "Effects",
+          "role": "fx",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2
+      }
+    },
+    {
+      "name": "music-stems",
+      "version": "2026-10-23.v1",
+      "dag": "music-stems-2026-10-23-v1",
+      "outputs": [
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "models": [
+        "HTDemucs4.th"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {},
+      "implementation": {
+        "dag_sha256": "4aadec0acf4d037d7075775c09db5f5199c85122dfb41d584d84ec66c2e4ba10",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "HTDemucs4.th",
+            "relpath": "music_stems/four_stem/HTDemucs4.th",
+            "sha256": "8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4",
+            "size_bytes": 84141911
+          },
+          {
+            "kind": "config",
+            "model": "HTDemucs4.th",
+            "relpath": "music_stems/four_stem/HTDemucs4.yaml",
+            "sha256": "340cd3f1f00f75f521a38235f7689d95a9e820738439561ca79818e54bc8863a",
+            "size_bytes": 1826
+          }
+        ]
+      },
+      "output_roles": [
+        {
+          "native_stem": "drums",
+          "role": "drums",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "bass",
+          "role": "bass",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "other",
+          "role": "other",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "vocals",
+          "role": "vocals",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2
+      }
+    },
+    {
+      "name": "mp3-restoration",
+      "version": "2026-10-23.v1",
+      "dag": "mp3-restoration-2026-10-23-v1",
+      "outputs": [
+        "restored",
+        "addition"
+      ],
+      "models": [
+        "apollo_model_uni.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {},
+      "implementation": {
+        "dag_sha256": "84a155bbfa00332f157569fceae1a66fc05ed9248c0aabf098837c7e003aaa19",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "apollo_model_uni.ckpt",
+            "relpath": "experimental_general/apollo_model_uni.ckpt",
+            "sha256": "11433256eca90143d32f1108d156ac756fd0201fbc69e5f736def4062fb52186",
+            "size_bytes": 146867952
+          },
+          {
+            "kind": "config",
+            "model": "apollo_model_uni.ckpt",
+            "relpath": "experimental_general/apollo_model_uni.yaml",
+            "sha256": "b8907db2acddef203f3e3c17fd71c2025a32732c7693988e74a7781515a699dd",
+            "size_bytes": 494
+          }
+        ]
+      },
+      "output_roles": [
+        {
+          "native_stem": "restored",
+          "role": "restored",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "addition",
+          "role": "addition",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2
+      }
+    }
+  ]
+}

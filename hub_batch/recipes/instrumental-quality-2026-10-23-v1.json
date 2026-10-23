@@ -1,0 +1,124 @@
+{
+  "version": 0.4,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "input_audio",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "mss_separate",
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 1
+        },
+        {
+          "name": "params",
+          "type": "MSS_PARAMS",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "vocals (Audio)",
+          "type": "AUDIO"
+        },
+        {
+          "name": "vocals (String)",
+          "type": "STRING"
+        },
+        {
+          "name": "other (Audio)",
+          "type": "AUDIO"
+        },
+        {
+          "name": "other (String)",
+          "type": "STRING"
+        }
+      ],
+      "widgets_values": [
+        "big_beta5e.ckpt",
+        "cuda",
+        false,
+        "hf-mirror",
+        "0",
+        false
+      ]
+    },
+    {
+      "id": 3,
+      "type": "pymss_save_audio",
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 2
+        }
+      ],
+      "outputs": [],
+      "widgets_values": [
+        "wav",
+        "vocals",
+        "48000",
+        "PCM_24",
+        "PCM_24",
+        "320k"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "pymss_save_audio",
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "widgets_values": [
+        "wav",
+        "instrumental",
+        "48000",
+        "PCM_24",
+        "PCM_24",
+        "320k"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "AUDIO"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "AUDIO"
+    ],
+    [
+      3,
+      2,
+      2,
+      4,
+      0,
+      "AUDIO"
+    ]
+  ]
+}

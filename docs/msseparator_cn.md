@@ -22,7 +22,22 @@ separator = MSSeparator.from_model_name(
 separator.process_folder("path/to/input_file_or_folder")
 ```
 
-`from_model_name()` 会根据 pymss 的模型 catalog 解析 `model_type`、权重路径和配置路径，然后把剩余参数继续传给 `MSSeparator(...)`。
+`from_model_name()` 会根据 pymss 的模型 catalog 或本地注册的用户模型解析 `model_type`、权重路径和配置路径，然后把剩余参数继续传给 `MSSeparator(...)`。
+
+注册自定义本地模型后，可按名字复用：
+
+```python
+from pymss import register_model, MSSeparator
+
+register_model(
+    "my_bs",
+    "bs_conformer",
+    "/path/model.ckpt",
+    "/path/config.yaml",
+    overlap_size=44100,
+)
+separator = MSSeparator.from_model_name("my_bs")
+```
 
 ## `from_model_name()` 参数
 
@@ -33,7 +48,7 @@ separator.process_folder("path/to/input_file_or_folder")
 | `download` | `bool` | `False` | 为 `True` 时，加载前会下载缺失的模型文件。为 `False` 时，缺少文件会直接报错。 |
 | `source` | `str` | `"modelscope"` | 传给模型下载器的下载源。 |
 | `endpoint` | `str \| None` | `None` | 可选的下载端点覆盖。 |
-| `**kwargs` | 任意 | - | 直接转发给 `MSSeparator(...)`，例如 `device`、`output_format`、`store_dirs`、`audio_params`、`debug`、`inference_params`。 |
+| `**kwargs` | 任意 | - | 直接转发给 `MSSeparator(...)`，例如 `device`、`output_format`、`store_dirs`、`save_as_folder`、`audio_params`、`debug`、`inference_params`。 |
 
 ## 构造函数
 
@@ -47,6 +62,7 @@ separator = MSSeparator(
     output_format="wav",
     use_tta=False,
     store_dirs="results",
+    save_as_folder=False,
     audio_params={
         "wav_bit_depth": "FLOAT",
         "flac_bit_depth": "PCM_24",
@@ -73,7 +89,7 @@ separator = MSSeparator(
 
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `model_type` | `str` | 必填 | 模型架构或运行类型。常见值包括 `bs_roformer`、`mel_band_roformer`、`htdemucs`、`mdx23c`、`bandit`、`bandit_v2`、`scnet`、`apollo`、`vr`、`legacy_demucs`、`legacy_tasnet`。使用 catalog 模型时通常不需要手动设置。 |
+| `model_type` | `str` | 必填 | 模型架构或运行类型。常见值包括 `bs_roformer`、`bs_conformer`、`mel_band_roformer`、`mel_band_conformer`、`htdemucs`、`mdx23c`、`bandit`、`bandit_v2`、`scnet`、`apollo`、`vr`、`legacy_demucs`、`legacy_tasnet`。使用 catalog 模型时通常不需要手动设置。 |
 | `model_path` | `str` | 必填 | 模型权重文件路径。扩展名取决于模型类型，例如 `.ckpt`、`.th`、`.pth`。 |
 | `config_path` | `str \| None` | `None` | MSS 类模型使用的 YAML 配置路径。不传时，pymss 会尝试使用 `model_path + ".yaml"`。VR 模型使用内置 VR 元数据，不使用 MSS YAML 配置。 |
 | `device` | `str` | `"auto"` | 运行设备。可选值为 `auto`、`cpu`、`cuda`、`mps`、`mlx`。`auto` 优先选择 CUDA，其次 Apple MPS，最后 CPU。`mlx` 是 Apple Silicon MLX 后端的公开快捷写法，内部会通过 `device="mps"` 和 MLX 模型参数运行。 |
@@ -81,10 +97,11 @@ separator = MSSeparator(
 | `output_format` | `str` | `"wav"` | `process_folder()` 和 `save_audio()` 保存文件时使用的格式。支持 `wav`、`flac`、`mp3`、`m4a`。 |
 | `use_tta` | `bool` | `False` | 是否启用测试时增强。对 MSS 模型来说，会运行多个变换版本并合并结果。可能略微提升质量，但会增加推理时间。 |
 | `store_dirs` | `str \| dict` | `"results"` | `process_folder()` 使用的输出路径。字符串表示所有保存的音轨都写入同一个文件夹；字典可以把不同音轨映射到文件夹、文件夹列表、`None` 或空值。`None` 或缺少某个音轨表示不保存该音轨。 |
+| `save_as_folder` | `bool` | `False` | 为 `True` 且 `store_dirs` 最终只指向一个输出文件夹时，每个输入音频会单独保存到以音频 basename 命名的子文件夹中，例如 `results/song/song_vocals.wav`。当 `store_dirs` 是单一路径，或字典中所有需要保存的目标都指向同一文件夹时生效。 |
 | `audio_params` | `dict` | 见下文 | 保存音频文件时使用的编码参数。 |
 | `logger` | `logging.Logger \| None` | `None` | Logger 实例。不传时使用 `pymss.get_separation_logger()`。 |
 | `debug` | `bool` | `False` | 是否启用 debug 日志，并关闭部分面向普通 CLI 输出的进度条行为。 |
-| `progress_callback` | callable \| `None` | `None` | 可选进度回调，会传给底层 demix/VR 逻辑，用于获取长时间推理过程中的进度。 |
+| `progress_callback` | callable \| `None` | `None` | 可选进度回调，会传给底层 demix/VR 逻辑。demix 进度会以 `callback(done_seconds, total_seconds, message)` 的形式返回。 |
 | `inference_params` | `dict` | 见下文 | 推理时的运行参数覆盖。支持的 key 取决于模型。 |
 
 ## 使用 `store_dirs` 控制输出
@@ -106,6 +123,19 @@ store_dirs = {
 ```
 
 这会把 `vocals` 写入一个文件夹，把 `instrumental` 写入两个文件夹，并跳过 `drums`。音轨名会和模型配置里的 instruments 匹配。初始化时，非法的音轨 key 会被移除并写入 warning 日志。
+
+如果希望每个输入音频的输出音轨放在单独文件夹中，可以设置 `save_as_folder=True`：
+
+```python
+separator = MSSeparator.from_model_name(
+    "bs_roformer_voc_hyperacev2",
+    store_dirs="results",
+    save_as_folder=True,
+)
+separator.process_folder("song.wav")
+```
+
+这会把音轨写入 `results/song/`，例如 `results/song/song_vocals.wav` 和 `results/song/song_instrumental.wav`。该选项只在 `store_dirs` 是单个文件夹路径，或字典里所有需要保存的目标都指向同一文件夹时生效。如果不同音轨被路由到不同文件夹，pymss 会保持原本的 `store_dirs` 布局。
 
 当 `inference_params["normalize"]` 启用时，pymss 会把所有需要保存的音轨放在一起分离，以便根据这些输出音轨统一计算归一化增益。如果一个六轨模型只保存两个音轨，那么只会对这两个保存的音轨联动归一化。
 
