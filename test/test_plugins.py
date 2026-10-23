@@ -32,6 +32,9 @@ from pymss.plugins.install import InstallError, install, uninstall
 def _reset_registry():
     """Each test starts with a clean registry and loader cache."""
     reg = get_registry()
+    # Restore registrations already loaded by other suites: clearing a module's
+    # side-effect registrations cannot make Python re-import that module later.
+    before = (dict(reg.capabilities), dict(reg.nodes), list(reg.cli_commands), set(reg._reserved_node_types))
     reg.capabilities.clear()
     reg.nodes.clear()
     reg.cli_commands.clear()
@@ -43,6 +46,10 @@ def _reset_registry():
     reg.cli_commands.clear()
     reg._reserved_node_types.clear()
     reset()
+    reg.capabilities.update(before[0])
+    reg.nodes.update(before[1])
+    reg.cli_commands.extend(before[2])
+    reg._reserved_node_types.update(before[3])
 
 
 def test_register_capability_direct():

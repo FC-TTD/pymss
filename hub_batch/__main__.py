@@ -8,38 +8,20 @@ from .api import build_app
 from .engine import load_engine, completion, release
 from .jobs import Jobs
 from .msst_compat import CompatTasks
-from .provider import ProfileManifest, ProfileRegistry
-
-
-def default_profiles():
-    return ProfileRegistry([
-        ProfileManifest("dialogue-vocal", "2026-09-20.v1", "duality-two-stems",
-                        outputs=("Vocals", "Instrumental"),
-                        models=("melband_roformer_instvox_duality_v2.ckpt",), max_concurrency=1),
-        ProfileManifest("instrumental-separation", "2026-09-20.v1", "instrumental-only",
-                        outputs=("Instrumental",),
-                        models=("mel_band_roformer_instrumental_becruily.ckpt",), max_concurrency=1),
-        ProfileManifest("dialogue-and-instrumental", "2026-09-20.v1", "dedicated-me",
-                        outputs=("dialogue", "instrumental"),
-                        models=("melband_roformer_instvox_duality_v2.ckpt",
-                                "mel_band_roformer_instrumental_becruily.ckpt"), max_concurrency=1),
-        ProfileManifest("dialogue-and-instrumental-dedicated", "2026-09-20.v1", "dedicated-me",
-                        outputs=("dialogue", "instrumental"),
-                        models=("melband_roformer_instvox_duality_v2.ckpt",
-                                "mel_band_roformer_instrumental_becruily.ckpt"), max_concurrency=1),
-    ])
+from .profiles import default_profiles
 
 
 def create_app():
     runtime = Runtime(load_engine, completion=completion, release=release,
                       gpu_process=True, execution_timeout=None)
+    profiles = default_profiles()
     jobs = Jobs(runtime, os.environ["PYMSS_BATCH_STATE_DIR"],
-                os.environ["PYMSS_BATCH_INPUT_ROOT"], os.environ["PYMSS_BATCH_OUTPUT_ROOT"])
+                os.environ["PYMSS_BATCH_INPUT_ROOT"], os.environ["PYMSS_BATCH_OUTPUT_ROOT"], profiles)
     compat = CompatTasks(runtime, os.environ["PYMSS_BATCH_STATE_DIR"],
                          os.environ["PYMSS_BATCH_INPUT_ROOT"], os.environ["PYMSS_BATCH_OUTPUT_ROOT"])
     runtime.pending_work = jobs.store.pending
     return attach(build_app(jobs, os.getenv("PYMSS_API_KEY"), compat=compat,
-                            profile_registry=default_profiles()), runtime=runtime)
+                            profile_registry=profiles), runtime=runtime)
 
 
 if __name__ == "__main__":

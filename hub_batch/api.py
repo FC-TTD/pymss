@@ -10,13 +10,20 @@ from ttd_model_runtime.protocol import HubError
 
 from .jobs import Busy, TERMINAL
 from .provider import ProfileRegistry
+from .contract import discovery, receipt, result_task, submission
 
 
 class BatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    recipe: str
-    input_paths: list[str] = Field(min_length=1)
+    recipe: str | None = None
+    profile_id: str | None = None
+    profile: str | None = None
+    profile_version: str | None = None
+    implementation_version: str | None = None
+    inputs: list[str] | None = Field(default=None, min_length=1)
+    input_paths: list[str] | None = Field(default=None, min_length=1)
     output_dir: str | None = None
+    options: dict = Field(default_factory=dict)
 
 
 def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry | None = None):
@@ -96,15 +103,6 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
         async def compat_submit(request: Request):
             return await submit_compat(request)
 
-        @app.post("/v1/separations", dependencies=[Depends(authorize)])
-        async def separation_submit(request: Request):
-            """Stable Profile + Batch provider smoke endpoint.
-
-            Gateway owns the public business task; this endpoint only exposes
-            provider execution and accepts one or many input paths.
-            """
-            return await submit_compat(request)
-
         @app.get("/api/v1/tasks/{task_id}", dependencies=[Depends(authorize)])
         async def compat_status(task_id: str):
             try:
@@ -127,15 +125,45 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
                 raise HTTPException(404, "task not found") from None
 
     def get(task_id):
+        if jobs is None:
+            raise HTTPException(503, "provider jobs unavailable")
         try:
             return jobs.store.get(task_id)
         except KeyError:
             raise HTTPException(404, "batch not found") from None
 
+    @app.get("/v1/separations/profiles", dependencies=[Depends(authorize)])
+    def profiles():
+        registry = profile_registry or (jobs.profile_registry if jobs is not None else None)
+        if registry is None:
+            raise HTTPException(503, "profile registry unavailable")
+        return discovery(registry)
+
+    @app.post("/v1/separations", status_code=202, dependencies=[Depends(authorize)])
+    async def separation_submit(request: Request):
+        try:
+            payload = await request.json()
+            normalized = submission(payload)
+            if jobs is None:
+                # Old installations may expose only the legacy compatibility
+                # engine; validate input before reporting that upgrade is needed.
+                for path in normalized["paths"]:
+                    from pathlib import Path
+                    Path(path).resolve(strict=True)
+                raise HTTPException(503, "provider jobs unavailable")
+            return receipt(jobs.submit(**normalized))
+        except Busy as exc:
+            raise HTTPException(429, str(exc)) from None
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from None
+
     @app.post("/v1/batches", status_code=202, dependencies=[Depends(authorize)])
     def submit(body: BatchRequest):
         try:
-            return jobs.submit(body.recipe, body.input_paths, body.output_dir)
+            if jobs is None:
+                raise HTTPException(503, "provider jobs unavailable")
+            task = jobs.submit(**submission(body.model_dump(exclude_none=True)))
+            return receipt(task) if task.get("profile") else task
         except Busy as exc:
             raise HTTPException(429, str(exc)) from None
         except (ValueError, OSError) as exc:
@@ -143,13 +171,23 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
 
     @app.get("/v1/batches/{task_id}", dependencies=[Depends(authorize)])
     def status(task_id: str):
-        return get(task_id)
+        task = get(task_id)
+        return receipt(task) if task.get("profile") else task
+
+    @app.get("/v1/batches/{task_id}/result", dependencies=[Depends(authorize)])
+    def result(task_id: str):
+        task = get(task_id)
+        if task["status"] not in TERMINAL:
+            raise HTTPException(409, "batch result is not ready")
+        task = result_task(task)
+        return receipt(task) if task.get("profile") else task
 
     @app.post("/v1/batches/{task_id}/cancel", dependencies=[Depends(authorize)])
     def cancel(task_id: str):
         get(task_id)
         try:
-            return jobs.cancel(task_id)
+            task = jobs.cancel(task_id)
+            return receipt(task) if task.get("profile") else task
         except HubError as exc:
             raise HTTPException(503, exc.code) from None
 
@@ -161,6 +199,8 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
             previous = None
             while True:
                 task = get(task_id)
+                if task.get("profile"):
+                    task = receipt(task)
                 payload = json.dumps(task)
                 if payload != previous:
                     yield f"event: task\ndata: {payload}\n\n"

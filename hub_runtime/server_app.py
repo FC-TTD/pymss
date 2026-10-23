@@ -922,74 +922,31 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
             raise APIError(503, "separation_unavailable", "Provider batch service is unavailable.")
         return jobs
 
-    def _provider_task_payload(task):
-        """Expose a stable provider task view while retaining file paths.
-
-        The Gateway owns its durable public manifest; this response is only a
-        provider execution receipt. ``task_id`` and ``id`` are both emitted so
-        older adapters can roll forward without guessing a second identifier.
-        """
-        files = []
-        for item in task.get("files", []):
-            output_files = []
-            for output in item.get("outputs", item.get("output_files", [])) or []:
-                if isinstance(output, dict):
-                    path = output.get("path") or output.get("name")
-                else:
-                    path = output
-                if path:
-                    output_files.append(str(path))
-            files.append({
-                "index": item.get("index"),
-                "input": item.get("input"),
-                "status": "success" if item.get("status") == "succeeded" else item.get("status", "failed"),
-                "error": item.get("error"),
-                "output_files": output_files,
-                "outputs": item.get("outputs", []),
-            })
-        return {
-            "task_id": task["id"], "id": task["id"],
-            "status": task.get("status", "unknown"),
-            "state": task.get("status", "unknown"),
-            "profile": task.get("profile"), "recipe": task.get("recipe"),
-            "progress": task.get("progress"),
-            "processed_files": task.get("processed_files", 0),
-            "total_files": task.get("total_files", 0),
-            "files": files, "error": task.get("error"),
-        }
+    from hub_batch.contract import discovery, receipt as _provider_task_payload, result_task, submission
 
     async def _batch_payload(request):
         body = await _read_body(request, state)
         try:
-            payload = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise APIError(400, "invalid_request", "Request body must be valid JSON.")
-        if not isinstance(payload, dict):
-            raise APIError(400, "invalid_request", "JSON request body must be an object.")
-        inputs = payload.get("input_paths", payload.get("inputs"))
-        if not isinstance(inputs, list) or not inputs or any(not isinstance(item, str) for item in inputs):
-            raise APIError(400, "invalid_request", "inputs must be a non-empty list of paths.", param="inputs")
-        profile = payload.get("profile_id", payload.get("profile"))
-        profile_version = payload.get("profile_version")
-        recipe = payload.get("recipe")
-        if profile is None and recipe is None:
-            raise APIError(400, "invalid_request", "profile_id/profile or recipe is required.")
-        return payload, inputs, profile, profile_version, recipe
+            return submission(json.loads(body.decode("utf-8")))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise APIError(400, "invalid_request", str(exc)) from None
+
+    @app.get("/v1/separations/profiles")
+    async def provider_profiles(request: Request):
+        _check_auth(request, state)
+        registry = _provider_jobs().profile_registry
+        if registry is None:
+            raise APIError(503, "separation_unavailable", "Profile registry is unavailable.")
+        return discovery(registry)
 
     @app.post("/v1/separations", status_code=202)
     async def submit_separation(request: Request):
         """Submit a provider Profile task through the formal Runtime entry."""
         _check_auth(request, state)
         provider_jobs = _provider_jobs()
-        payload, inputs, profile, profile_version, recipe = await _batch_payload(request)
+        payload = await _batch_payload(request)
         try:
-            task = provider_jobs.submit(
-                recipe=recipe,
-                paths=inputs,
-                output_dir=payload.get("output_dir"),
-                profile=profile,
-                profile_version=profile_version,
-            )
+            task = provider_jobs.submit(**payload)
             return _provider_task_payload(task)
         except (ValueError, OSError) as exc:
             raise APIError(400, "invalid_request", str(exc)) from None
@@ -1004,15 +961,9 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
         """Submit a fixed DAG or immutable Profile over one or more files."""
         _check_auth(request, state)
         provider_jobs = _provider_jobs()
-        payload, inputs, profile, profile_version, recipe = await _batch_payload(request)
+        payload = await _batch_payload(request)
         try:
-            task = provider_jobs.submit(
-                recipe=recipe,
-                paths=inputs,
-                output_dir=payload.get("output_dir"),
-                profile=profile,
-                profile_version=profile_version,
-            )
+            task = provider_jobs.submit(**payload)
             return _provider_task_payload(task)
         except (ValueError, OSError) as exc:
             raise APIError(400, "invalid_request", str(exc)) from None
@@ -1040,7 +991,7 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
             raise APIError(404, "task_not_found", "Batch task was not found.") from None
         if task["status"] not in {"succeeded", "failed", "cancelled", "unknown"}:
             raise APIError(409, "result_not_ready", "Batch result is not ready.")
-        return _provider_task_payload(task)
+        return _provider_task_payload(result_task(task))
 
     @app.post("/v1/batches/{task_id}/cancel")
     async def provider_batch_cancel(task_id: str, request: Request):
@@ -1068,7 +1019,7 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
                     task = provider_jobs.store.get(task_id)
                 except KeyError:
                     return
-                payload = json.dumps(task, ensure_ascii=False)
+                payload = json.dumps(_provider_task_payload(task), ensure_ascii=False)
                 if payload != previous:
                     yield f"event: task\ndata: {payload}\n\n"
                     previous = payload

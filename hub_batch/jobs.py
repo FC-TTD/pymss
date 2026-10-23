@@ -52,7 +52,7 @@ class Store:
         for task_id, body in self.db.execute("SELECT id,body FROM batches").fetchall():
             task = json.loads(body)
             if task["status"] not in TERMINAL:
-                task.update(status="unknown", error="service restarted before confirmed completion")
+                task.update(status="unknown", stage="unknown", error="service restarted before confirmed completion")
                 try:
                     files = committed_files(task)
                     if files is not None:
@@ -113,7 +113,10 @@ class Jobs:
         self.owner = None
         self.closed = False
 
-    def submit(self, recipe=None, paths=None, output_dir=None, *, profile=None, profile_version=None):
+    def submit(self, recipe=None, paths=None, output_dir=None, *, profile=None, profile_version=None,
+               options=None, implementation_version=None):
+        if options is not None and (not isinstance(options, dict) or options):
+            raise ValueError("this provider accepts only empty options")
         if not paths:
             raise ValueError("input_paths are required")
         manifest = None
@@ -125,7 +128,11 @@ class Jobs:
             except KeyError as exc:
                 raise ValueError(f"profile not found: {exc.args[0]}") from None
             recipe = manifest.dag
-        if recipe not in RECIPES:
+            if implementation_version is not None and implementation_version != manifest.digest:
+                raise ValueError("profile implementation version mismatch")
+        elif implementation_version is not None:
+            raise ValueError("implementation_version requires a profile")
+        if recipe not in RECIPES and not (manifest and manifest.implementation):
             raise ValueError("a supported recipe or profile is required")
         inputs = []
         for raw in paths:
@@ -144,6 +151,8 @@ class Jobs:
             task = {"id": task_id, "status": "queued", "recipe": recipe,
                     "profile": manifest.to_dict() if manifest is not None else None,
                     "input_paths": inputs, "output_dir": str(output), "files": [],
+                    "options": {}, "cancel_requested": False, "stage": "queued",
+                    "started_at": None, "finished_at": None,
                     "processed_files": 0, "total_files": len(inputs), "created_at": time.time()}
             self.store.put(task)
             owner = self.owner = Owner(task_id)
@@ -173,17 +182,24 @@ class Jobs:
                     self.store.update(task_id, files=files, processed_files=len(files))
             elif value["kind"] != "progress" or time.monotonic() - last_progress > .1:
                 last_progress = time.monotonic()
-                self.store.update(task_id, progress=value)
+                self.store.update(task_id, progress=value, stage=value.get("stage", "running"))
 
         status, error, files = "failed", None, None
         try:
             if owner.cancel.is_set():
                 raise NativeCancelled()
-            with self.runtime.execution():
+            profile = task.get("profile") or {}
+            metadata = {}
+            if profile.get("implementation"):
+                metadata = {"provider_metadata": {"implementation": "pymss-profile",
+                            "profile_id": profile["name"], "profile_version": profile["version"],
+                            "implementation_digest": profile["digest"]}}
+            self.store.update(task_id, stage="admitting")
+            with self.runtime.execution(**metadata):
                 with self.guard:
                     owner.engine = self.runtime.get()
                     if not owner.cancel.is_set():
-                        self.store.update(task_id, status="running")
+                        self.store.update(task_id, status="running", stage="loading", started_at=time.time())
                     owner.engine.prepare(task_id)
                     if owner.cancel.is_set():
                         owner.engine.cancel(task_id)
@@ -207,14 +223,14 @@ class Jobs:
             error = str(exc)
         finally:
             try:
-                values = {"status": status, "error": error}
+                values = {"status": status, "stage": status, "error": error, "finished_at": time.time()}
                 try:
                     saved = committed_files(task)
                     if saved is not None:
                         files = saved
                 except (OSError, ValueError, KeyError):
                     status = "unknown"
-                    values.update(status=status, error="result manifest could not be confirmed")
+                    values.update(status=status, stage=status, error="result manifest could not be confirmed")
                 if files is not None:
                     values.update(files=files, processed_files=len(files))
                 self.store.update(task_id, **values)
@@ -231,9 +247,9 @@ class Jobs:
                 return task
             owner = self.owner
             if owner is None or owner.task_id != task_id:
-                return self.store.update(task_id, status="unknown", error="task owner unavailable")
+                return self.store.update(task_id, status="unknown", stage="unknown", error="task owner unavailable")
             owner.cancel.set()
-            self.store.update(task_id, status="cancelling")
+            self.store.update(task_id, status="cancelling", stage="cancelling", cancel_requested=True)
             if owner.engine is not None:
                 owner.engine.cancel(task_id)
             return self.store.get(task_id)

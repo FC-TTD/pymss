@@ -341,7 +341,10 @@ class NativeBoundaryTests(unittest.TestCase):
             "endpoint": None, "inference_params": {}, "max_concurrency": 3,
         }
         try:
-            desc, results = backend.separate(spec, np.zeros(16), ["vocals"])
+            # NativeBackend supplies its native factory explicitly to the
+            # coordinator. Patch that boundary so this CPU test never downloads.
+            with patch.object(backend, "_native_factory", side_effect=factory):
+                desc, results = backend.separate(spec, np.zeros(16), ["vocals"])
             self.assertEqual(desc["model_id"], MODEL)
             self.assertIn("vocals", results)
             self.assertEqual(seen, [{

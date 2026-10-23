@@ -58,6 +58,9 @@ class ProfileManifest:
     max_concurrency: int = 1
     memory_budget_bytes: int | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
+    implementation: Mapping[str, Any] = field(default_factory=dict)
+    output_roles: tuple[Mapping[str, Any], ...] = ()
+    output_media: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.name.strip() or not self.version.strip() or not self.dag.strip():
@@ -67,9 +70,16 @@ class ProfileManifest:
         object.__setattr__(self, "outputs", tuple(self.outputs))
         object.__setattr__(self, "models", tuple(self.models))
         object.__setattr__(self, "options", _jsonable(dict(self.options)))
+        object.__setattr__(self, "implementation", _jsonable(dict(self.implementation)))
+        object.__setattr__(self, "output_roles", tuple(_jsonable(dict(item)) for item in self.output_roles))
+        object.__setattr__(self, "output_media", _jsonable(dict(self.output_media)))
+        if self.implementation:
+            native = [item.get("native_stem") for item in self.output_roles]
+            roles = [item.get("role") for item in self.output_roles]
+            if native != list(self.outputs) or len(set(roles)) != len(roles) or not all(roles):
+                raise ValueError("profile outputs must have unique explicit roles for every native stem")
 
-    @property
-    def digest(self) -> str:
+    def _payload(self) -> dict[str, Any]:
         payload = {
             "name": self.name,
             "version": self.version,
@@ -78,22 +88,23 @@ class ProfileManifest:
             "models": list(self.models),
             "max_concurrency": self.max_concurrency,
             "memory_budget_bytes": self.memory_budget_bytes,
-            "options": self.options,
+            "options": _jsonable(self.options),
         }
+        # Preserve the published legacy digest exactly. New manifests bind all
+        # implementation bytes and semantic output/media declarations.
+        if self.implementation:
+            payload.update(implementation=_jsonable(self.implementation),
+                           output_roles=_jsonable(self.output_roles),
+                           output_media=_jsonable(self.output_media))
+        return payload
+
+    @property
+    def digest(self) -> str:
+        payload = self._payload()
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "version": self.version,
-            "dag": self.dag,
-            "outputs": list(self.outputs),
-            "models": list(self.models),
-            "max_concurrency": self.max_concurrency,
-            "memory_budget_bytes": self.memory_budget_bytes,
-            "options": dict(self.options),
-            "digest": self.digest,
-        }
+        return {**self._payload(), "digest": self.digest}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ProfileManifest":
@@ -106,6 +117,9 @@ class ProfileManifest:
             max_concurrency=int(value.get("max_concurrency", 1)),
             memory_budget_bytes=value.get("memory_budget_bytes"),
             options=value.get("options", {}),
+            implementation=value.get("implementation", {}),
+            output_roles=tuple(value.get("output_roles", ())),
+            output_media=value.get("output_media", {}),
         )
 
 
@@ -116,25 +130,25 @@ class ProfileRegistry:
         if manifests is None:
             self._profiles = {}
         elif isinstance(manifests, Mapping):
-            self._profiles = dict(manifests)
+            self._profiles = {key: ProfileManifest.from_dict(value.to_dict()) for key, value in manifests.items()}
         else:
-            self._profiles = {f"{item.name}@{item.version}": item for item in manifests}
+            self._profiles = {f"{item.name}@{item.version}": ProfileManifest.from_dict(item.to_dict()) for item in manifests}
 
     def register(self, manifest: ProfileManifest) -> None:
         key = f"{manifest.name}@{manifest.version}"
         current = self._profiles.get(key)
         if current is not None and current.digest != manifest.digest:
             raise ValueError(f"profile version already registered with different manifest: {key}")
-        self._profiles[key] = manifest
+        self._profiles[key] = ProfileManifest.from_dict(manifest.to_dict())
 
     def resolve(self, name: str, version: str | None = None) -> ProfileManifest:
         if version is None:
             candidates = [item for item in self._profiles.values() if item.name == name]
             if not candidates:
                 raise KeyError(name)
-            return sorted(candidates, key=lambda item: item.version)[-1]
+            return ProfileManifest.from_dict(sorted(candidates, key=lambda item: item.version)[-1].to_dict())
         try:
-            return self._profiles[f"{name}@{version}"]
+            return ProfileManifest.from_dict(self._profiles[f"{name}@{version}"].to_dict())
         except KeyError:
             raise KeyError(f"{name}@{version}") from None
 
@@ -146,6 +160,24 @@ class ProfileRegistry:
         for entry in entries:
             registry.register(ProfileManifest.from_dict(entry))
         return registry
+
+    def list(self) -> list[ProfileManifest]:
+        return [ProfileManifest.from_dict(self._profiles[key].to_dict()) for key in sorted(self._profiles)]
+
+
+def profile_output_contract(manifest):
+    """Describe old published DAG stems without changing their manifest digest."""
+    roles = list(manifest.output_roles)
+    if not roles:
+        if manifest.dag == "dedicated-me":
+            native_roles = (("Vocals", "dialogue"), ("Instrumental", "instrumental"))
+        else:
+            native_roles = tuple((stem, stem.lower()) for stem in manifest.outputs)
+        roles = [{"native_stem": stem, "role": role, "required": True,
+                  "media_type": "audio/wav", "formats": ["wav"]} for stem, role in native_roles]
+    media = dict(manifest.output_media) or {"media_type": "audio/wav", "container": "wav",
+                                          "sample_rate": 48000, "bits_per_sample": 24, "channels": 2}
+    return roles, media
 
 
 class ModelCoordinator:

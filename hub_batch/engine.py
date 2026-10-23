@@ -1,7 +1,9 @@
 """Runs only inside the SDK-owned GPU process."""
 from pathlib import Path
 import json
+import hashlib
 import os
+import re
 import threading
 import numpy as np
 
@@ -11,7 +13,7 @@ from pymss.graph import SeparatorCache, load_comfy_file, run_dag
 from ttd_model_runtime.engine import engine_progress
 from ttd_model_runtime.protocol import NativeCancelled
 
-from .provider import CoordinatedSeparator, ModelCoordinator, SharedModel
+from .provider import CoordinatedSeparator, ModelCoordinator, SharedModel, profile_output_contract
 
 RECIPES = ("duality-two-stems", "instrumental-only", "dedicated-me")
 BUDGET_BYTES = 8 * 1024 ** 3
@@ -63,8 +65,8 @@ class BatchEngine:
             self.cancelled.set()
             return True
 
-    def run(self, task_id, recipe, inputs, output_dir, *, max_concurrency=None):
-        if recipe not in RECIPES:
+    def run(self, task_id, recipe, inputs, output_dir, *, max_concurrency=None, profile=None):
+        if recipe not in RECIPES and not (profile and profile.implementation):
             raise ValueError("unsupported recipe")
         if not self.execution.acquire(blocking=False):
             raise RuntimeError("batch engine is busy")
@@ -87,7 +89,13 @@ class BatchEngine:
             with self.guard:
                 if self.task_id != task_id:
                     raise RuntimeError("batch task was not prepared")
-            dag = load_comfy_file(Path(__file__).parent / "recipes" / f"{recipe}.json")
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", recipe):
+                raise ValueError("invalid packaged recipe reference")
+            recipe_path = Path(__file__).parent / "recipes" / f"{recipe}.json"
+            if profile and profile.implementation:
+                notify({"kind": "stage", "stage": "verifying_implementation"})
+                self._verify_implementation(profile, recipe_path)
+            dag = load_comfy_file(recipe_path)
             for index, source in enumerate(inputs):
                 notify({"kind": "file_start", "index": index, "input": source})
 
@@ -105,7 +113,10 @@ class BatchEngine:
                         separator_cache=self.cache, name_prefix=f"{index:06d}",
                         progress_callback=progress,
                     )
-                    item.update(status="succeeded", outputs=[r.to_dict() for r in result.records])
+                    outputs = [r.to_dict() for r in result.records]
+                    if profile:
+                        outputs = self._profile_outputs(profile, outputs, Path(output_dir) / f"{index:06d}")
+                    item.update(status="succeeded", outputs=outputs)
                 except NativeCancelled:
                     raise
                 except Exception as exc:
@@ -131,8 +142,58 @@ class BatchEngine:
         """Execute an immutable profile manifest through the DAG runner."""
         return self.run(
             task_id, profile.dag, inputs, output_dir,
-            max_concurrency=profile.max_concurrency,
+            max_concurrency=profile.max_concurrency, profile=profile,
         )
+
+    @staticmethod
+    def _sha256(path):
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _verify_implementation(self, profile, recipe_path):
+        if self._sha256(recipe_path) != profile.implementation.get("dag_sha256"):
+            raise ValueError("profile DAG digest mismatch")
+        root = Path(self.model_dir).resolve(strict=True)
+        for asset in profile.implementation.get("assets", ()):
+            path = (root / asset["relpath"]).resolve(strict=True)
+            if not path.is_relative_to(root) or not path.is_file():
+                raise ValueError("profile asset must be a file inside the model directory")
+            if path.stat().st_size != asset["size_bytes"] or self._sha256(path) != asset["sha256"]:
+                raise ValueError("profile asset digest mismatch")
+
+    @classmethod
+    def _profile_outputs(cls, profile, outputs, output_dir):
+        import soundfile as sf
+
+        roles, media = profile_output_contract(profile)
+        expected = {item["native_stem"]: item for item in roles}
+        stems = [item["stem"] for item in outputs]
+        if len(stems) != len(expected) or set(stems) != set(expected):
+            raise ValueError("profile output stems do not match the complete declared roles")
+        root = Path(output_dir).resolve(strict=True)
+        seen = set()
+        validated = {}
+        for item in outputs:
+            path = Path(item["path"]).resolve(strict=True)
+            if not path.is_relative_to(root) or path in seen or not path.is_file():
+                raise ValueError("profile output must be a distinct file inside its input output directory")
+            seen.add(path)
+            info = sf.info(path)
+            if (info.format != "WAV" or info.subtype != "PCM_24" or info.frames <= 0
+                    or info.samplerate != media["sample_rate"] or info.channels != media["channels"]):
+                raise ValueError("profile output media does not match WAV PCM24 48 kHz stereo")
+            declaration = expected[item["stem"]]
+            validated[item["stem"]] = {
+                **item, "role": declaration["role"], "required": declaration["required"],
+                "media_type": media["media_type"], "format": "wav", "bits_per_sample": 24,
+                "sample_rate": info.samplerate, "channels": info.channels,
+                "duration_ms": round(info.frames / info.samplerate * 1000),
+                "size_bytes": path.stat().st_size, "sha256": cls._sha256(path),
+            }
+        return [validated[item["native_stem"]] for item in roles]
 
     def close(self):
         self.cache.close()
