@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1
+# Incremental Bandit fix over the accepted Profile image. BASE_IMAGE must be
+# pinned to its immutable digest; CUDA, Torch, pymss-core and SDK are inherited.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG SOURCE_REV
+WORKDIR /opt/pymss-fork
+COPY --link pymss/utils.py ./pymss/utils.py
+COPY --link pymss/modules/bandit_mono.py ./pymss/modules/bandit_mono.py
+LABEL org.opencontainers.image.source="https://github.com/FC-TTD/pymss" org.opencontainers.image.revision="${SOURCE_REV}"

@@ -110,6 +110,13 @@ def get_model_from_config(model_type, config_path, model_kwargs_override=None):
         return _core_get_model_from_config(
             model_type, config_path, model_kwargs_override=model_kwargs_override
         )
+    if model_type == "bandit":
+        config = load_config(config_path)
+        kwargs = {**config.model, **(model_kwargs_override or {})}
+        if kwargs.get("in_channel") == 1:
+            from .modules.bandit_mono import ChannelIndependentBandit
+
+            return ChannelIndependentBandit(**kwargs), config
     if model_type == "bandit_v2":
         config = load_config(config_path)
         from .modules.bandit_v2.bandit import Bandit
