@@ -9,6 +9,9 @@ ARG HUB_IMAGE
 ARG SOURCE_REV
 WORKDIR /app
 RUN python -c 'import re,sys; assert all(re.fullmatch(r".+@sha256:[a-f0-9]{64}", v) for v in sys.argv[1:])' "${BASE_IMAGE}" "${HUB_IMAGE}"
+# A previous managed image may retain its SDK wheel staging directory.
+# Copying a new directory merges files, so remove only this build-time staging.
+RUN rm -rf /tmp/hub-runtime-wheel
 COPY --from=runtime_package /opt/hub-runtime-wheel /tmp/hub-runtime-wheel
 RUN python -m pip install --no-deps --no-cache-dir /tmp/hub-runtime-wheel/*.whl
 # Install the new core before copying frequently changing application source.
