@@ -62,6 +62,7 @@ class LegacyWorkflowRunner:
         progress_callback: Callable[[int, int, str | None], None] | None = None,
         progress_event_callback: Callable[[dict[str, Any]], None] | None = None,
         separator_cache_max_entries: int | None = 1,
+        execution_event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.workflow = validate_workflow(workflow)
         self.model_dir = model_dir
@@ -78,6 +79,7 @@ class LegacyWorkflowRunner:
         self.progress_callback = progress_callback
         self.progress_event_callback = progress_event_callback
         self.separator_cache_max_entries = separator_cache_max_entries
+        self.execution_event_callback = execution_event_callback
         # ``separator_factory`` is accepted for API compatibility with the old
         # runner (tests inject fakes). When provided, we hand it to the cache so
         # the same fakes drive the DAG path.
@@ -110,6 +112,7 @@ class LegacyWorkflowRunner:
                         debug=self.debug,
                         progress_callback=self._wrap_progress(track_name),
                         progress_event_callback=self._wrap_progress_event(track_name),
+                        execution_event_callback=self._wrap_execution_event(track_name),
                         strict=True,
                         model_dir=self.model_dir,
                         download=self.download,
@@ -158,6 +161,15 @@ class LegacyWorkflowRunner:
 
         def cb(event):
             self.progress_event_callback({**event, "track": track_name})
+
+        return cb
+
+    def _wrap_execution_event(self, track_name: str):
+        if self.execution_event_callback is None:
+            return None
+
+        def cb(event):
+            self.execution_event_callback({**event, "track": track_name})
 
         return cb
 

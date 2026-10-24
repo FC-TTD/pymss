@@ -137,6 +137,41 @@ pymss comfy run -c workflow.json \
 
 All comfy-mss nodes (`pymss_load_audio`, `pymss_mss_separate`, `pymss_audio_ensemble`, `pymss_save_audio`, ...) and ComfyUI core audio nodes (`SaveAudio`/`SaveAudioMP3`/`SaveAudioOpus`/`SaveAudioAdvanced`, `AudioMerge`, `AudioConcat`, `TrimAudioDuration`, `SplitAudioChannels`/`JoinAudioChannels`, `AudioAdjustVolume`, `EmptyAudio`, `AudioEqualizer3Band`, `PreviewAudio`, `LoadAudio`) are supported. Node executors consume built-in capabilities rather than reimplementing DSP, so the same `eq` / `mix` / `ensemble` / `{fmt}_encode` capabilities back the CLI, the Python API, and the workflow nodes. Pass `--no-strict` to skip unknown node types with a warning instead of failing.
 
+### Graph execution events (Python API)
+
+Graph hosts can observe execution without adding fields to ComfyUI workflows or changing node widgets:
+
+```python
+from pymss.graph import load_comfy_file, run_dag
+
+def on_event(event):
+    print(event["event"], event["node_id"], event["node_fraction"])
+
+outputs = run_dag(
+    load_comfy_file("workflow.json"),
+    output_dir="results",
+    execution_event_callback=on_event,
+)
+```
+
+`EXECUTION_EVENT_VERSION = 1` describes this optional, synchronous callback API. It is independent of ComfyUI's WebSocket transport; in particular, ComfyUI's `executed` message represents a UI update, while `node_completed` here always means the executor completed that node. Hosts translate events to their own display or transport. JSON parsing errors occur before `run_dag` and are raised by the loader. Existing `progress_callback`, `progress_event_callback`, and `PROGRESS_EVENT_VERSION` retain their contracts.
+
+| Events | Meaning |
+| --- | --- |
+| `execution_started`, `execution_completed` | Graph execution begins or finishes successfully, including empty DAGs. |
+| `node_started`, `node_completed` | A node begins execution or returns successfully. |
+| `node_progress` | Intermediate progress. A fraction of 1 can finish one audio item without completing the node. |
+| `node_failed`, `execution_failed` | Execution failed; the original exception still propagates. |
+| `node_cancelled`, `execution_cancelled` | Execution was interrupted by `KeyboardInterrupt` or `asyncio.CancelledError`; the interruption still propagates. |
+| `node_skipped` | An unknown node was skipped under an explicitly requested `strict=False`. |
+
+Every event contains `event`, `version`, `message`, `node_count`, and `overall_fraction`. Node-associated events also contain `node_id` (string), `node_type`, zero-based `node_index`, and `node_fraction`; these four fields are `None` when no node is involved. Progress events may include `audio_index` (one-based), `audio_count`, `done`, `total`, and `unit`. Failure/cancellation events contain `error_type`; an execution-level failure also identifies its node when available. Graph validation errors have no fabricated active node. Input-resolution errors can report `node_failed` before `node_started`.
+
+- Cancellation events report interruptions raised during execution. Cancellation remains controlled by the host; killing the process cannot deliver a final callback. Already written files are retained.
+- Callbacks must return promptly. `run_dag` propagates execution-observer errors and releases its owned separator cache; they are not reported back to the failing observer as node failures. If an observer raises while receiving an execution failure, the original execution exception and its explicit cause are preserved; the observer exception remains in `__context__`.
+- Event delivery does not change the default single-model cache limit. The caller remains responsible for closing a supplied `SeparatorCache`.
+- `LegacyWorkflowRunner` accepts `execution_event_callback` and adds `track` to events. `KeyboardInterrupt` and `asyncio.CancelledError` stop the whole folder run even with `continue_on_error=True`.
+
 ### CLI ensemble
 
 ```sh

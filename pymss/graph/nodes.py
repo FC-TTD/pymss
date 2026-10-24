@@ -105,7 +105,7 @@ def _progress_for(ctx: NodeContext, node_id: object, *, audio_index: int = 0, au
         nonlocal pass_index, last_done
         if ctx.progress_callback is not None:
             ctx.progress_callback(int(done), max(1, int(total)), f"node={node_id} {message or 'separate'}")
-        if ctx.progress_event_callback is None:
+        if ctx.progress_event_callback is None and ctx.execution_event_callback is None:
             return
         if passes > 1 and done == 0 and last_done > 0:
             pass_index = min(passes - 1, pass_index + 1)
