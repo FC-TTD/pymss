@@ -37,6 +37,8 @@ from .registry import (
     register_node,
     require_capability,
 )
+from .manifest import API_VERSION, ManifestError, PluginManifest, read_manifest
+from .lifecycle import PluginManager, PluginState, satisfies
 
 __all__ = [
     # registration API (plugin authors)
@@ -57,4 +59,12 @@ __all__ = [
     "PluginLoadResult",
     "DEFAULT_PLUGINS_DIR",
     "ENTRYPOINT_GROUP",
+    # plugin protocol v1 (docs/plugin-protocol.md)
+    "ManifestError",
+    "PluginManifest",
+    "PluginManager",
+    "PluginState",
+    "read_manifest",
+    "satisfies",
+    "API_VERSION",
 ]
