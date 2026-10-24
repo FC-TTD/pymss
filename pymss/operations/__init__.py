@@ -253,6 +253,11 @@ class Runtime:
 
         Registrations made by a plugin whose setup() raises are rolled back,
         and the failure recorded in the report.
+
+        Protocol v1 (docs/plugin-protocol.md): plugins with a
+        ``[tool.pymss.plugin]`` manifest go through the PluginManager
+        (dependency resolution, ordered activation, blocked diagnostics).
+        Manifest-less plugins keep the legacy scan below.
         """
         import os
         from pathlib import Path
@@ -267,6 +272,24 @@ class Runtime:
         import importlib.util
         import sys
 
+        # ---- protocol v1: manifest plugins (resolve → ordered activate) ----
+        manifest_rows: dict[str, dict[str, Any]] = {}
+        try:
+            from ..plugins.lifecycle import PluginManager, pymss_package_version
+
+            manager = PluginManager(root)
+            manager.discover()
+            manager.resolve(pymss_version=pymss_package_version())
+            rows = manager.activate(lambda source: _RuntimePluginHandle(self, source=source))
+            for row in rows:
+                name = row.get("name")
+                if isinstance(name, str):
+                    manifest_rows[name] = row
+        except Exception as exc:  # noqa: BLE001 — lifecycle must not break legacy loading
+            self._load_report.append(
+                {"name": "<plugin-lifecycle>", "loaded": False, "error": f"{type(exc).__name__}: {exc}"}
+            )
+
         for child in sorted(root.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
                 continue
@@ -274,10 +297,34 @@ class Runtime:
                 (child / name for name in ("__init__.py", "plugin.py") if (child / name).exists()),
                 None,
             )
+            pyproject = child / "pyproject.toml"
             if entry_file is None:
-                self._load_report.append(
-                    {"name": child.name, "loaded": False, "error": "no entry file"}
-                )
+                if pyproject.exists() and child.name in manifest_rows:
+                    self._load_report.append(manifest_rows[child.name])
+                elif pyproject.exists():
+                    # Broken manifest (blocked at discovery) or manifest without entry file.
+                    from ..plugins.manifest import ManifestError, read_manifest
+
+                    try:
+                        read_manifest(child)
+                        self._load_report.append({"name": child.name, "loaded": False, "error": "no entry file"})
+                    except ManifestError as exc:
+                        self._load_report.append({"name": child.name, "loaded": False, "error": str(exc)})
+                else:
+                    self._load_report.append(
+                        {"name": child.name, "loaded": False, "error": "no entry file"}
+                    )
+                continue
+            if child.name in manifest_rows:
+                # Manifest plugin already handled by the lifecycle manager.
+                row = manifest_rows[child.name]
+                if row.get("loaded"):
+                    registered = sorted(
+                        op_id for op_id, entry in self._operations.items()
+                        if entry.source == f"plugin:{row.get('plugin_id')}"
+                    )
+                    row["operations"] = registered
+                self._load_report.append(row)
                 continue
             modname = f"_pymss_runtime_plugin_{child.name}"
             before = set(self._operations)
@@ -309,6 +356,8 @@ class Runtime:
                     {
                         "name": child.name,
                         "loaded": True,
+                        "legacy": True,
+                        "api_version": 0,
                         "operations": sorted(set(self._operations) - before),
                     }
                 )

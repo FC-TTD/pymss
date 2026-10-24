@@ -138,6 +138,8 @@ def register_builtin_operations() -> int:
 
     Idempotent: an already-registered id is skipped (external plugins may
     have claimed it first). Returns the number of newly registered ops.
+    Includes the file-level kit operations (convert / inspect / sdr / slice /
+    merge) from ``kit_builtins.py``.
     """
     runtime = default_runtime()
     registered = 0
@@ -146,4 +148,7 @@ def register_builtin_operations() -> int:
             continue
         runtime.register(spec=spec, run=run, source=_BUILTIN_SOURCE)
         registered += 1
+    from .kit_builtins import register_kit_operations
+
+    registered += register_kit_operations()
     return registered
