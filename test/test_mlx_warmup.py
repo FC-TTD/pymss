@@ -189,18 +189,35 @@ def test_warmup_channel_candidates_prefers_declared_channels():
 
     assert _mlx_warmup_channel_candidates(model) == (2, 1)
 
-def test_warmup_runs_both_phases_with_real_shapes(fake_mlx):
+def test_warmup_uses_real_shape_directly_when_channels_known(fake_mlx):
     fake, cleared = fake_mlx
     model = FakeModel()
 
     assert warmup_mlx_full(model, _config(chunk_size=960000, batch_size=2)) is True
 
-    tiny_length = _mlx_warmup_length_candidates(model)[0]
-    assert model.calls == [(1, 2, tiny_length), (2, 2, 960000)]
-    assert fake.zero_shapes == [((1, 2, tiny_length), "float16"), ((2, 2, 960000), "float16")]
-    assert fake.eval_calls == 2
-    assert len(cleared) == 2
+    assert model.calls == [(2, 2, 960000)]
+    assert fake.zero_shapes == [((2, 2, 960000), "float16")]
+    assert fake.eval_calls == 1
+    assert len(cleared) == 1
     assert not hasattr(model, "_pymss_mlx_full_backend_error")
+
+
+def test_warmup_keeps_channel_probe_before_unknown_real_input(fake_mlx):
+    fake, cleared = fake_mlx
+    model = FakeModel(audio_channels=None, allowed_channels=(1,))
+    assert warmup_mlx_full(model, _config(batch_size=2)) is True
+    short = _mlx_warmup_length_candidates(model)[0]
+    assert model.calls == [(1, 2, short), (1, 1, short), (2, 1, 960000)]
+    assert fake.eval_calls == 2 and len(cleared) == 2
+
+
+def test_known_channels_still_validate_real_shape_and_report_failure(fake_mlx):
+    _, cleared = fake_mlx
+    model = FakeModel(allowed_lengths=(32768,))
+    assert warmup_mlx_full(model, _config()) is False
+    assert model.calls == [(2, 2, 960000)]
+    assert "STFT frame count" in model._pymss_mlx_full_backend_error
+    assert len(cleared) == 1
 
 def test_warmup_skips_real_shape_phase_without_chunk_size(fake_mlx):
     fake, cleared = fake_mlx
@@ -222,11 +239,11 @@ def test_warmup_probes_channel_count_on_value_error(fake_mlx):
 @pytest.mark.parametrize("batch_size", [1, 2])
 def test_warmup_runs_real_shape_once_after_short_probe_exhaustion(fake_mlx, batch_size):
     fake, cleared = fake_mlx
-    model = FakeModel(allowed_lengths=(960000,))
+    model = FakeModel(audio_channels=None, allowed_lengths=(960000,))
     lengths = _mlx_warmup_length_candidates(model)
 
     assert warmup_mlx_full(model, _config(batch_size=batch_size)) is True
-    assert model.calls == [(1, 2, length) for length in lengths] + [(batch_size, 2, 960000)]
+    assert model.calls == [(1, channels, length) for length in lengths for channels in (2, 1)] + [(batch_size, 2, 960000)]
     assert fake.eval_calls == 1
     assert len(cleared) == 1
     assert model.mps_model_backend == "mlx_full"
