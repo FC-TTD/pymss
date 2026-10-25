@@ -13,15 +13,11 @@ try/except, failures are recorded, and surfaced via ``pymss plugins list``.
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import logging
 import os
-import sys
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -73,100 +69,26 @@ def get_last_report() -> PluginLoadReport | None:
     return _LAST_REPORT
 
 
-def _import_plugin_module(modname: str, path: Path | None) -> bool:
-    """Import a plugin module by name (entrypoint) or file path (folder scan).
-
-    Returns True on success. Exceptions are logged by the caller.
-    """
-    if path is not None:
-        # Folder scan: load the file as a top-level module under a synthetic
-        # name so plugins don't need to be installed packages.
-        spec = importlib.util.spec_from_file_location(modname, path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"cannot load plugin module from {path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[modname] = module
-        try:
-            spec.loader.exec_module(module)  # type: ignore[union-attr]
-        except Exception:
-            sys.modules.pop(modname, None)
-            raise
-        # Optional new-style protocol: a setup(plugin) function receives a
-        # registration handle and contributes operations/capabilities through
-        # it. Imported module side effects (old style) still work; setup()
-        # failures are raised so the loader can record the plugin as failed
-        # instead of silently half-registering.
-        _call_plugin_setup(module)
-        return True
-    imported = importlib.import_module(modname)
-    _call_plugin_setup(imported)
-    return True
-
-
-def _call_plugin_setup(module: Any) -> None:
-    """Invoke an optional ``setup(plugin)`` hook on a plugin module.
-
-    The hook is optional (legacy import-side-effect plugins keep working).
-    Errors propagate to the caller so the plugin is reported as failed.
-    """
-    setup = getattr(module, "setup", None)
-    if setup is None:
-        return
-    from . import PluginRegistration
-
-    setup(PluginRegistration(source=module.__name__))
-
-
 def _scan_folder(plugins_dir: Path, report: PluginLoadReport) -> None:
-    """Import every subdirectory of plugins_dir that has an entry file."""
+    """Use the same manifest lifecycle for CLI and other runtime hosts."""
     if not plugins_dir.exists():
         return
-    for child in sorted(plugins_dir.iterdir()):
-        if not child.is_dir():
-            continue
-        if child.name.startswith("_") or child.name.startswith("."):
-            continue
-        # Prefer __init__.py, fall back to plugin.py.
-        entry = None
-        for candidate in ("__init__.py", "plugin.py"):
-            p = child / candidate
-            if p.exists():
-                entry = p
-                break
-        if entry is None:
-            report.results.append(
-                PluginLoadResult(
-                    name=child.name,
-                    source=f"folder:{child}",
-                    loaded=False,
-                    error="no __init__.py or plugin.py found",
-                    path=str(child),
-                )
-            )
-            continue
-        modname = f"_pymss_plugin_{child.name}"
-        try:
-            _import_plugin_module(modname, entry)
-            report.results.append(
-                PluginLoadResult(
-                    name=child.name,
-                    source=f"folder:{child}",
-                    loaded=True,
-                    path=str(entry),
-                )
-            )
-            logger.debug("loaded plugin '%s' from %s", child.name, entry)
-        except Exception as exc:  # noqa: BLE001
-            report.results.append(
-                PluginLoadResult(
-                    name=child.name,
-                    source=f"folder:{child}",
-                    loaded=False,
-                    error=f"{type(exc).__name__}: {exc}",
-                    path=str(entry),
-                )
-            )
-            logger.warning("plugin '%s' failed to load: %s", child.name, exc)
+    from ..operations import default_runtime
+
+    for row in default_runtime().load_plugins():
+        name = str(row.get("name") or "")
+        directory = plugins_dir / name
+        entry = next(
+            (directory / filename for filename in ("__init__.py", "plugin.py") if (directory / filename).is_file()),
+            directory,
+        )
+        report.results.append(PluginLoadResult(
+            name=name,
+            source=f"folder:{directory}",
+            loaded=bool(row.get("loaded")),
+            error=row.get("error"),
+            path=str(entry),
+        ))
 
 
 def _scan_entrypoints(report: PluginLoadReport) -> None:

@@ -10,13 +10,59 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+from importlib.machinery import ModuleSpec
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 from typing import Any
+from uuid import uuid4
 
 from .manifest import API_VERSION, ManifestError, PluginManifest, parse_entry_point, read_manifest
+
+
+def _remove_plugin_modules(namespace: str) -> None:
+    for name in tuple(sys.modules):
+        if name == namespace or name.startswith(namespace + "."):
+            sys.modules.pop(name, None)
+
+
+def _import_manifest_entry(directory: Path, module_name: str, explicit: bool) -> tuple[ModuleType, str]:
+    """Load plugin-local modules beneath a private package without changing sys.path."""
+    namespace = f"_pymss_manifest_plugin_{uuid4().hex}"
+    entry_file = directory / "__init__.py"
+    if explicit and not all(part.isidentifier() for part in module_name.split(".")):
+        raise ImportError(f"invalid plugin entry module {module_name!r}")
+    try:
+        if entry_file.is_file():
+            spec = importlib.util.spec_from_file_location(
+                namespace, entry_file, submodule_search_locations=[str(directory)],
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"cannot load plugin entry {entry_file}")
+            root = importlib.util.module_from_spec(spec)
+            sys.modules[namespace] = root
+            spec.loader.exec_module(root)
+        else:
+            root = ModuleType(namespace)
+            root.__path__ = [str(directory)]
+            root.__package__ = namespace
+            root.__spec__ = ModuleSpec(namespace, loader=None, is_package=True)
+            root.__spec__.submodule_search_locations = root.__path__
+            sys.modules[namespace] = root
+        if not explicit:
+            module = root if entry_file.is_file() else importlib.import_module(f"{namespace}.plugin")
+        elif module_name == directory.name and entry_file.is_file() and not (
+            (directory / f"{module_name}.py").is_file() or (directory / module_name).is_dir()
+        ):
+            module = root
+        else:
+            module = importlib.import_module(f"{namespace}.{module_name}")
+        return module, namespace
+    except BaseException:
+        _remove_plugin_modules(namespace)
+        raise
 
 _CONSTRAINT_RE = re.compile(r"^(==|>=|<=|>|<|~=)?\s*(.+)$")
 
@@ -211,49 +257,14 @@ class PluginManager:
             if state.status == "blocked":
                 continue
             module_name, attr = parse_entry_point(manifest.entry, state.directory)
-            entry_file = state.directory / "__init__.py"
             handle = None
+            namespace = None
             try:
-                if manifest.entry and "." not in module_name and attr:
-                    # Explicit entry inside the plugin package (e.g. "my_chain:setup"):
-                    # the module file lives in the plugin directory, which is not on
-                    # sys.path — load it directly from its file location.
-                    module_file = state.directory / f"{module_name}.py"
-                    if not module_file.is_file():
-                        module_file = state.directory / module_name / "__init__.py"
-                    if not module_file.is_file():
-                        raise ImportError(
-                            f"entry module {module_name!r} not found in plugin directory {state.directory}"
-                        )
-                    synthetic = f"_pymss_manifest_plugin_{state.name}_{module_name}"
-                    spec = importlib.util.spec_from_file_location(synthetic, module_file)
-                    if spec is None or spec.loader is None:
-                        raise ImportError(f"cannot load plugin entry {module_file}")
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules[synthetic] = module
-                    try:
-                        spec.loader.exec_module(module)
-                    except Exception:
-                        sys.modules.pop(synthetic, None)
-                        raise
-                elif manifest.entry:
-                    module = importlib.import_module(module_name)
-                else:
-                    synthetic = f"_pymss_manifest_plugin_{state.name}"
-                    spec = importlib.util.spec_from_file_location(synthetic, entry_file)
-                    if spec is None or spec.loader is None:
-                        raise ImportError(f"cannot load plugin entry {entry_file}")
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules[synthetic] = module
-                    try:
-                        spec.loader.exec_module(module)
-                    except Exception:
-                        sys.modules.pop(synthetic, None)
-                        raise
+                handle = registration_factory(f"plugin:{manifest.plugin_id}")
+                module, namespace = _import_manifest_entry(state.directory, module_name, bool(manifest.entry))
                 setup = getattr(module, attr, None)
                 if setup is None:
                     raise AttributeError(f"entry {module_name}:{attr} has no {attr!r}")
-                handle = registration_factory(f"plugin:{manifest.plugin_id}")
                 setup(handle)
                 state.status = "activated"
                 state.contributions = manifest.to_dict()["contributions"]
@@ -267,9 +278,9 @@ class PluginManager:
                         handle.rollback()
                     except Exception:  # noqa: BLE001 — rollback must not mask the failure
                         pass
+                if namespace is not None:
+                    _remove_plugin_modules(namespace)
                 self._block_transitive_dependents(manifest.plugin_id)
-            finally:
-                pass
         # Rows are built after the whole pass so blocked/failed dependents
         # reflect their final state regardless of activation order.
         report.extend(self._row(state) for state in ordered)
@@ -284,6 +295,7 @@ class PluginManager:
     def _block_transitive_dependents(self, failed_plugin_id: str) -> None:
         """Mark every plugin that (transitively) depends on a failed plugin blocked."""
         changed = True
+        failed_ids = {failed_plugin_id}
         while changed:
             changed = False
             for other in self._states.values():
@@ -291,10 +303,12 @@ class PluginManager:
                 if other_manifest is None or other.status in {"blocked", "failed"}:
                     continue
                 deps = set(other_manifest.dependencies)
-                if failed_plugin_id in deps:
+                failed_dependencies = deps & failed_ids
+                if failed_dependencies:
                     other.status = "blocked"
                     other.error = f"dependency {failed_plugin_id} failed to activate"
-                    other.blocked_by.append(failed_plugin_id)
+                    other.blocked_by.extend(sorted(failed_dependencies))
+                    failed_ids.add(other_manifest.plugin_id)
                     changed = True
 
     # ---- report ----

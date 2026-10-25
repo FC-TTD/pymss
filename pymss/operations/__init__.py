@@ -329,13 +329,13 @@ class Runtime:
                 continue
             modname = f"_pymss_runtime_plugin_{child.name}"
             before = set(self._operations)
+            handle = _RuntimePluginHandle(self, source=modname)
             try:
                 spec = importlib.util.spec_from_file_location(modname, entry_file)
                 module = importlib.util.module_from_spec(spec)
                 sys.modules[modname] = module
                 try:
                     spec.loader.exec_module(module)
-                    handle = _RuntimePluginHandle(self, source=modname)
                     setup = getattr(module, "setup", None)
                     if setup is not None:
                         setup(handle)
@@ -343,8 +343,7 @@ class Runtime:
                     sys.modules.pop(modname, None)
                     raise
             except Exception as exc:  # noqa: BLE001
-                for op_id in set(self._operations) - before:
-                    del self._operations[op_id]
+                handle.rollback()
                 self._load_report.append(
                     {
                         "name": child.name,
@@ -376,9 +375,15 @@ class _RuntimePluginHandle:
     source: str
 
     def __init__(self, runtime: "Runtime", source: str):
+        from ..plugins.registry import get_registry
+
         self.runtime = runtime
         self.source = source
-        self._operation_ids: list[str] = []
+        registry = get_registry()
+        self._operations_before = dict(runtime._operations)
+        self._capabilities_before = dict(registry.capabilities)
+        self._nodes_before = dict(registry.nodes)
+        self._cli_before = list(registry.cli_commands)
 
     def register_operation(self, *, id, params, inputs=None, outputs=None, run=None, **kwargs):
         spec = OperationSpec(
@@ -393,13 +398,32 @@ class _RuntimePluginHandle:
         if run is None:
             raise OperationError(f"operation {id!r} requires a run handler")
         self.runtime.register(spec=spec, run=run, source=self.source)
-        self._operation_ids.append(spec.id)
 
     def rollback(self) -> None:
-        """Remove every operation this handle registered (setup failed midway)."""
-        for op_id in self._operation_ids:
-            self.runtime._operations.pop(op_id, None)
-        self._operation_ids.clear()
+        """Restore registrations made or replaced during this plugin's activation."""
+        from ..plugins.registry import get_registry
+
+        self.runtime._operations.clear()
+        self.runtime._operations.update(self._operations_before)
+        registry = get_registry()
+        for current, before in (
+            (registry.capabilities, self._capabilities_before),
+            (registry.nodes, self._nodes_before),
+        ):
+            # Importing graph modules may initialize builtins. Preserve those
+            # registrations because Python retains the imported modules too.
+            builtins = {
+                name: entry for name, entry in current.items()
+                if name not in before and entry.source in {"builtin", "pymss.builtin"}
+            }
+            current.clear()
+            current.update(builtins)
+            current.update(before)
+        builtin_commands = [
+            entry for entry in registry.cli_commands
+            if entry.source == "builtin" and not any(entry is previous for previous in self._cli_before)
+        ]
+        registry.cli_commands[:] = [*self._cli_before, *builtin_commands]
 
     # Legacy compatibility surface: a runtime plugin may still contribute
     # capabilities/nodes/cli via the old global registry if it wants to.

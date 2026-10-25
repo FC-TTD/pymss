@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
+from unittest.mock import patch
 
 from pymss.plugins import ManifestError, PluginManager, read_manifest, satisfies
 from pymss.plugins.lifecycle import pymss_package_version
@@ -120,17 +124,30 @@ class LifecycleTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        os.environ["PYMSS_PLUGINS_DIR"] = str(self.root)
-        self.addCleanup(os.environ.pop, "PYMSS_PLUGINS_DIR", None)
+        environment = patch.dict(os.environ, {"PYMSS_PLUGINS_DIR": str(self.root)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        from pymss.plugins import get_registry
+
+        registry = get_registry()
+        capabilities, nodes, commands = dict(registry.capabilities), dict(registry.nodes), list(registry.cli_commands)
+        self.addCleanup(lambda: registry.capabilities.update(capabilities))
+        self.addCleanup(registry.capabilities.clear)
+        self.addCleanup(lambda: registry.nodes.update(nodes))
+        self.addCleanup(registry.nodes.clear)
+        self.addCleanup(lambda: registry.cli_commands.__setitem__(slice(None), commands))
+        self.addCleanup(setattr, ops, "_DEFAULT_RUNTIME", ops._DEFAULT_RUNTIME)
 
     def plugin(self, name: str, plugin_id: str, version: str, deps: dict | None = None,
-               body: str = "", broken: bool = False) -> Path:
+               body: str = "", broken: bool = False, entry: str | None = None) -> Path:
         directory = self.root / name
         directory.mkdir(parents=True, exist_ok=True)
         lines = [
             "[project]", f'name = "pymss-plugin-{name}"', f'version = "{version}"', "",
             "[tool.pymss.plugin]", f'id = "{plugin_id}"', "api_version = 1", "",
         ]
+        if entry is not None:
+            lines.append(f'entry = "{entry}"')
         if deps:
             lines.append("[tool.pymss.plugin.dependencies]")
             lines += [f'"{k}" = "{v}"' for k, v in deps.items()]
@@ -193,6 +210,7 @@ class LifecycleTests(unittest.TestCase):
     def test_failed_activation_blocks_dependents_and_reports(self):
         self.plugin("broken", "author.broken", "1.0.0", broken=True)
         self.plugin("user", "author.user", "1.0.0", deps={"author.broken": ">=1"})
+        self.plugin("grandchild", "author.grandchild", "1.0.0", deps={"author.user": ">=1"})
         manager = PluginManager(self.root)
         manager.discover()
         manager.resolve()
@@ -202,6 +220,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(by_id["author.broken"]["status"], "failed")
         self.assertIn("setup exploded", by_id["author.broken"]["error"])
         self.assertEqual(by_id["author.user"]["status"], "blocked")
+        self.assertEqual(by_id["author.grandchild"]["status"], "blocked")
         self.assertIn("failed to activate", by_id["author.user"]["error"])
         self.assertEqual([op["id"] for op in runtime.list_operations()], [])
 
@@ -248,6 +267,103 @@ class LifecycleTests(unittest.TestCase):
         states = {s.name: s for s in manager.discover()}
         self.assertEqual(states["badm"].status, "blocked")
         self.assertIn("plugin id", states["badm"].error)
+
+    def test_entry_modules_and_packages_support_relative_imports(self):
+        cases = [
+            ("flat", "entry:setup", "entry.py", "helper.py", ".helper"),
+            ("package", "pkg:setup", "pkg/__init__.py", "pkg/helper.py", ".helper"),
+            ("nested", "pkg.handlers:setup", "pkg/handlers.py", "pkg/helper.py", ".helper"),
+            ("default", None, "__init__.py", "helper.py", ".helper"),
+        ]
+        original_path = list(sys.path)
+        for name, entry, filename, helper, relative in cases:
+            with self.subTest(entry=entry):
+                plugin_id = f"author.{name}"
+                directory = self.plugin(name, plugin_id, "1.0.0", entry=entry)
+                for path, contents in {
+                    helper: "VALUE = 42\n",
+                    filename: (
+                        f"from {relative} import VALUE\n"
+                        "def setup(plugin):\n"
+                        f"    plugin.register_operation(id='{plugin_id}.run', inputs={{}}, "
+                        "params={'type':'object','properties':{}}, outputs={'value':{'type':'number'}}, "
+                        "run=lambda c,i,p: {'value': VALUE})\n"
+                    ),
+                }.items():
+                    target = directory / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(contents, encoding="utf-8")
+                if filename.startswith("pkg/"):
+                    (directory / "pkg/__init__.py").touch(exist_ok=True)
+                runtime = ops.Runtime()
+                rows = runtime.load_plugins()
+                row = next(row for row in rows if row["name"] == name)
+                self.assertTrue(row["loaded"], row)
+                self.assertEqual(runtime.run(f"{plugin_id}.run", inputs={}, params={}), {"value": 42})
+        self.assertEqual(sys.path, original_path)
+
+    def test_failed_setup_restores_all_registration_types_and_modules(self):
+        from pymss.plugins import get_registry
+
+        registry = get_registry()
+        registry.register_capability("shared_cap", lambda: "original", source="existing")
+        registry.register_node("SharedNode", lambda *args: None, source="existing")
+        registry.register_cli(("existing", "run"), lambda args: 0, source="existing")
+        original_cap = registry.capabilities["shared_cap"]
+        original_node = registry.nodes["SharedNode"]
+        original_commands = list(registry.cli_commands)
+        modules_before = {name for name in sys.modules if name.startswith("_pymss_manifest_plugin_")}
+        self.plugin("broken", "author.broken", "1.0.0", body=(
+            "from pymss.plugins import register_capability\n"
+            "register_capability('import_side_effect', lambda: 1)\n"
+            "def setup(plugin):\n"
+            "    plugin.register_operation(id='author.broken.run', inputs={}, "
+            "params={'type':'object','properties':{}}, outputs={}, run=lambda c,i,p: {})\n"
+            "    plugin.register_capability('shared_cap', lambda: 'replacement')\n"
+            "    plugin.register_node('SharedNode', lambda *args: None)\n"
+            "    plugin.register_cli(('broken','run'), lambda args: 0)\n"
+            "    raise RuntimeError('failed after registration')\n"
+        ))
+        runtime = ops.Runtime()
+        row = runtime.load_plugins()[0]
+        self.assertFalse(row["loaded"])
+        self.assertEqual(runtime.list_operations(), [])
+        self.assertIs(registry.capabilities["shared_cap"], original_cap)
+        self.assertIs(registry.nodes["SharedNode"], original_node)
+        self.assertNotIn("import_side_effect", registry.capabilities)
+        self.assertEqual(registry.cli_commands, original_commands)
+        self.assertEqual(
+            {name for name in sys.modules if name.startswith("_pymss_manifest_plugin_")}, modules_before,
+        )
+
+    def test_cli_uses_manifest_lifecycle_and_activates_once(self):
+        import pymss.cli as cli
+        import pymss.plugins as plugins
+
+        directory = self.plugin("custom", "author.custom", "1.0.0", entry="entry:setup")
+        (directory / "entry.py").write_text(
+            "from pathlib import Path\n"
+            "def setup(plugin):\n"
+            "    counter = Path(__file__).parent / 'calls.txt'\n"
+            "    counter.write_text((counter.read_text() if counter.exists() else '') + '1')\n"
+            "    plugin.register_operation(id='author.custom.run', inputs={}, "
+            "params={'type':'object','properties':{}}, outputs={}, run=lambda c,i,p: {})\n",
+            encoding="utf-8",
+        )
+        future = self.plugin("future", "author.future", "1.0.0", body="raise RuntimeError('must not execute')\n")
+        manifest = future / "pyproject.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8").replace("api_version = 1", "api_version = 999"), encoding="utf-8")
+        plugins.reset()
+        self.addCleanup(plugins.reset)
+        ops._DEFAULT_RUNTIME = None
+        output = io.StringIO()
+        with patch("pymss.plugins.loader._scan_entrypoints"), redirect_stdout(output):
+            self.assertEqual(cli.main(["ops", "list"]), 0)
+            self.assertEqual(cli.main(["ops", "list"]), 0)
+        self.assertIn("author.custom.run", output.getvalue())
+        self.assertEqual((directory / "calls.txt").read_text(), "1")
+        failed = next(row for row in plugins.get_last_report().failed if row.name == "future")
+        self.assertIn("api_version 999", failed.error)
 
 
 class GraphOperationTests(unittest.TestCase):
