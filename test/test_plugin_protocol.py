@@ -82,7 +82,7 @@ modes = ["rendered_preview", "offline_export"]
         self.assertEqual(manifest.plugin_id, "author.chain")
         self.assertEqual(manifest.version, "1.2.0")
         self.assertEqual(manifest.dependencies, {"author.denoise": ">=1,<2"})
-        self.assertEqual(manifest.graphs[0].file, plugin / "graphs" / "chain.json")
+        self.assertTrue(manifest.graphs[0].file.samefile(plugin / "graphs" / "chain.json"))
         self.assertEqual(manifest.views[0].placements, ("tool", "workspace"))
         self.assertIn("files.pickAudio", manifest.views[0].permissions)
         self.assertEqual(manifest.player[0].scopes, ("clip",))
