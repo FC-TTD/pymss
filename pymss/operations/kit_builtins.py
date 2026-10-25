@@ -159,19 +159,26 @@ def _sdr_run(ctx, inputs, params):
     reference_path = _audio_source(inputs["reference"])
     estimated_path = _audio_source(inputs["estimated"])
 
-    def load_stereo(path: Path) -> np.ndarray:
+    def load_stereo(path: Path, sample_rate: int | None = None) -> tuple[np.ndarray, int]:
         from ..audio_io import load_audio
 
-        audio, _sr = load_audio(str(path), sr=None, mono=False)
+        audio, sr = load_audio(str(path), sr=sample_rate, mono=False)
         audio = np.asarray(audio, dtype=np.float64)
         if audio.ndim == 1:
             audio = np.stack([audio, audio])
         elif audio.shape[0] == 1:
             audio = np.repeat(audio, 2, axis=0)
-        return audio[:2]
+        return audio[:2], int(sr)
 
-    reference = load_stereo(reference_path)
-    estimated = load_stereo(estimated_path)
+    # Compare on one shared timeline: resample the estimated track to the
+    # reference's rate when they differ (same signal at 44.1k vs 48k must
+    # compare as identical, not as a sample-index misalignment).
+    reference, reference_sr = load_stereo(reference_path)
+    estimated, estimated_sr = load_stereo(estimated_path)
+    if estimated_sr != reference_sr:
+        # One shared timeline: resample the estimated track to the reference's
+        # rate (same signal at 44.1k vs 48k must compare as identical).
+        estimated, _ = load_stereo(estimated_path, sample_rate=reference_sr)
     channels = min(reference.shape[0], estimated.shape[0])
     samples = min(reference.shape[1], estimated.shape[1])
     if channels <= 0 or samples <= 0:

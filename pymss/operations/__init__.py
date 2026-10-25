@@ -237,9 +237,10 @@ class Runtime:
     ) -> dict[str, Any]:
         entry = self._require_entry(operation_id)
         _check_inputs(entry.spec, inputs)
+        resolved = _resolve_input_values(entry.spec, inputs)
         merged = _merge_and_validate_params(operation_id, entry.spec.params, params)
         ctx = context or OperationContext()
-        result = entry.run(ctx, dict(inputs), merged)
+        result = entry.run(ctx, resolved, merged)
         if not isinstance(result, Mapping):
             raise OperationError(
                 f"operation {operation_id!r} must return a mapping of named outputs"
@@ -374,6 +375,11 @@ class _RuntimePluginHandle:
     runtime: Runtime
     source: str
 
+    def __init__(self, runtime: "Runtime", source: str):
+        self.runtime = runtime
+        self.source = source
+        self._operation_ids: list[str] = []
+
     def register_operation(self, *, id, params, inputs=None, outputs=None, run=None, **kwargs):
         spec = OperationSpec(
             id=id,
@@ -387,6 +393,13 @@ class _RuntimePluginHandle:
         if run is None:
             raise OperationError(f"operation {id!r} requires a run handler")
         self.runtime.register(spec=spec, run=run, source=self.source)
+        self._operation_ids.append(spec.id)
+
+    def rollback(self) -> None:
+        """Remove every operation this handle registered (setup failed midway)."""
+        for op_id in self._operation_ids:
+            self.runtime._operations.pop(op_id, None)
+        self._operation_ids.clear()
 
     # Legacy compatibility surface: a runtime plugin may still contribute
     # capabilities/nodes/cli via the old global registry if it wants to.
@@ -405,6 +418,29 @@ class _RuntimePluginHandle:
         from pymss.plugins import register_cli
 
         register_cli(path, func, help=help, source=self.source, add_arguments=add_arguments)
+
+
+def _resolve_input_values(spec: OperationSpec, inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """Coerce file descriptors into typed artifacts per the declared port type.
+
+    The CLI passes ``{"kind": "file", "path": ...}`` descriptors; operations
+    declared with an ``audio`` port expect an ``AudioArtifact``. Load at the
+    boundary so every caller (CLI, bridge, tests) shares one conversion path.
+    """
+    resolved: dict[str, Any] = dict(inputs)
+    for port_name, port_spec in spec.inputs.items():
+        value = resolved.get(port_name)
+        if not isinstance(value, Mapping) or value.get("kind") != "file":
+            continue
+        if not str(port_spec.get("type", "")).lower() == "audio":
+            continue
+        from ..graph.core import AudioArtifact
+        from ..audio_io import load_audio
+
+        path = str(value.get("path", ""))
+        mix, sr, layout = load_audio(path, sr=None, mono=False, return_layout=True)
+        resolved[port_name] = AudioArtifact(mix, int(sr), source_path=path, channel_layout=layout)
+    return resolved
 
 
 def _check_inputs(spec: OperationSpec, inputs: Mapping[str, Any]) -> None:

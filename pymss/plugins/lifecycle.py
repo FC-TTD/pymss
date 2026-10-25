@@ -212,8 +212,31 @@ class PluginManager:
                 continue
             module_name, attr = parse_entry_point(manifest.entry, state.directory)
             entry_file = state.directory / "__init__.py"
+            handle = None
             try:
-                if manifest.entry:
+                if manifest.entry and "." not in module_name and attr:
+                    # Explicit entry inside the plugin package (e.g. "my_chain:setup"):
+                    # the module file lives in the plugin directory, which is not on
+                    # sys.path — load it directly from its file location.
+                    module_file = state.directory / f"{module_name}.py"
+                    if not module_file.is_file():
+                        module_file = state.directory / module_name / "__init__.py"
+                    if not module_file.is_file():
+                        raise ImportError(
+                            f"entry module {module_name!r} not found in plugin directory {state.directory}"
+                        )
+                    synthetic = f"_pymss_manifest_plugin_{state.name}_{module_name}"
+                    spec = importlib.util.spec_from_file_location(synthetic, module_file)
+                    if spec is None or spec.loader is None:
+                        raise ImportError(f"cannot load plugin entry {module_file}")
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[synthetic] = module
+                    try:
+                        spec.loader.exec_module(module)
+                    except Exception:
+                        sys.modules.pop(synthetic, None)
+                        raise
+                elif manifest.entry:
                     module = importlib.import_module(module_name)
                 else:
                     synthetic = f"_pymss_manifest_plugin_{state.name}"
@@ -237,6 +260,13 @@ class PluginManager:
                 self._activated.append(state.name)
             except Exception as exc:  # noqa: BLE001 — plugin code must not break the host
                 state.status, state.error = "failed", f"{type(exc).__name__}: {exc}"
+                # Roll back anything the failing setup() already registered so a
+                # half-installed plugin leaves no orphaned operations behind.
+                if handle is not None:
+                    try:
+                        handle.rollback()
+                    except Exception:  # noqa: BLE001 — rollback must not mask the failure
+                        pass
                 self._block_transitive_dependents(manifest.plugin_id)
             finally:
                 pass

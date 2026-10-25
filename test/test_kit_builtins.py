@@ -163,3 +163,38 @@ class KitBuiltinTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SdrSampleRateTests(unittest.TestCase):
+    """Cross-rate comparison must align on one timeline (PR #33 review)."""
+
+    def test_sdr_cross_rate(self) -> None:
+        import numpy as np
+        import soundfile as sf
+
+        from pymss.operations import default_runtime
+
+        runtime = default_runtime()
+        with tempfile.TemporaryDirectory() as work:
+            work_dir = Path(work)
+            t = np.arange(44100, dtype=np.float64)
+            signal = 0.5 * np.sin(2 * np.pi * 1000.0 * t / 44100.0)
+            sf.write(work_dir / "ref44100.wav", signal.astype(np.float32), 44100)
+            # Same continuous signal sampled at 48 kHz.
+            t48 = np.arange(48000, dtype=np.float64)
+            signal48 = 0.5 * np.sin(2 * np.pi * 1000.0 * t48 / 48000.0)
+            sf.write(work_dir / "est48000.wav", signal48.astype(np.float32), 48000)
+            from test.test_kit_builtins import _silent_context
+
+            result = runtime.run(
+                "pymss.kit.sdr",
+                inputs={
+                    "reference": str(work_dir / "ref44100.wav"),
+                    "estimated": str(work_dir / "est48000.wav"),
+                },
+                params={},
+                context=_silent_context(),
+            )
+            sdr = float(result["report"]["average_sdr"])
+            # Identical analog content across rates must score high, not ~-3 dB.
+            self.assertGreater(sdr, 40.0, f"cross-rate SDR should be high, got {sdr}")

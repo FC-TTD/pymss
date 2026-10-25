@@ -72,7 +72,10 @@ def register_operation_node(
             params.update(node.data["params"])
         for pname in param_names:
             if pname in inputs and pname not in params:
-                params[pname] = inputs[pname]
+                value = inputs[pname]
+                # Graph links deliver Artifacts; parameter validation needs the
+                # underlying value (e.g. StringConstant → a string param).
+                params[pname] = getattr(value, "value", value)
         merged = _merge_and_validate_params(spec.id, spec.params, params)
 
         from . import OperationContext
