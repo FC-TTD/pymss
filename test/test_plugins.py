@@ -30,19 +30,33 @@ from pymss.plugins.install import InstallError, install, uninstall
 
 @pytest.fixture(autouse=True)
 def _reset_registry():
-    """Each test starts with a clean registry and loader cache."""
+    """Each test starts with a clean registry and loader cache.
+
+    Clearing only user registrations is not possible (registrations carry no
+    owner scope), so clear everything and restore the builtin registrations a
+    fresh process would have. Without the restore, tests that assert on the
+    builtin codec/DSP capabilities see an empty registry once this module has
+    run once (the autouse fixture leaks the cleared state across modules).
+    """
     reg = get_registry()
     reg.capabilities.clear()
     reg.nodes.clear()
     reg.cli_commands.clear()
     reg._reserved_node_types.clear()
     reset()
+    from pymss.plugins.builtins import register_builtin_capabilities
+    from pymss.plugins.codecs import register_builtin_codecs
+
+    register_builtin_capabilities()
+    register_builtin_codecs()
     yield
     reg.capabilities.clear()
     reg.nodes.clear()
     reg.cli_commands.clear()
     reg._reserved_node_types.clear()
     reset()
+    register_builtin_capabilities()
+    register_builtin_codecs()
 
 
 def test_register_capability_direct():

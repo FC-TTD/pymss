@@ -672,14 +672,20 @@ def run_dag(
     audio_params: dict[str, Any] | None = None,
     separator_cache: SeparatorCache | None = None,
     name_prefix: str = "",
+    node_results: dict[int, Any] | None = None,
     execution_event_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[str]:
-    """Execute a DAG and return saved paths.
+    """Execute a DAG and return the list of files written by output nodes.
+
+    ``node_results`` (optional) receives ``{node_id: NodeResult}`` for every
+    executed node — used by graph-backed operations to lift intermediate
+    artifacts as named outputs without forcing a Save node into the graph.
 
     ``execution_event_callback`` observes lifecycle events independently of
     legacy progress callbacks. Execution failures and interruptions still
     propagate to the caller.
     """
+    _load_builtin_nodes()
     output_path = Path(output_dir)
 
     owns_cache = separator_cache is None
@@ -778,6 +784,8 @@ def run_dag(
 
             result = node_info.execute(ctx, gathered)
             results[node.id] = result
+            if node_results is not None:
+                node_results[node.id] = result
             saved.extend(result.saved_paths)
             all_records.extend(result.saved_records)
 
