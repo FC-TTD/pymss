@@ -111,6 +111,8 @@ plugin.register_operation(
 
 参数绑定始终写入目标节点的 `data["params"]`。内置 Comfy 节点使用 `widgets_values`，因此需指定 `widget`，其索引必须是图中已存在的非负整数位置；省略时保留仅写 `data["params"]` 的插件节点行为。输出端口必须存在，不会回退到其他端口。每次执行使用独立临时目录，完成或失败后清理。
 
+音频输入绑定支持 `pymss_load_audio` 及其 `LoadAudio` 别名：`audio_input.widget=0` 写入临时音频路径，`widget=1` 写入运行时输入名；其他位置在构建时拒绝。
+
 ## 6. Studio SDK（消息协议）
 
 页面宿主以 sandbox iframe 加载 `entry`，SDK 走 `postMessage` JSON-RPC：

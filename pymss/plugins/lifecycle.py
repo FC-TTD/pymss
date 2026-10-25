@@ -73,7 +73,9 @@ def _parse_version(text: str) -> tuple[int, ...]:
         parts.append(int(chunk))
     while len(parts) < 3:
         parts.append(0)
-    return tuple(parts[:3])
+    while len(parts) > 3 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
 
 
 def satisfies(version: str, constraint: str) -> bool:
@@ -102,10 +104,13 @@ def _satisfies_one(version: str, constraint: str) -> bool:
     if operator == "<":
         return have < want
     if operator == "~=":
-        base = _parse_version(raw)[:2] if len(_parse_version(raw)) >= 2 else _parse_version(raw)
-        floor = base + (0,) * (2 - len(base))
-        ceiling = (floor[0], floor[1] + 1, 0)
-        return floor <= have < ceiling
+        release = re.match(r"^(\d+(?:\.\d+)+)", raw)
+        if release is None:
+            return False
+        prefix = tuple(int(part) for part in release.group(1).split("."))[:-1]
+        ceiling = prefix[:-1] + (prefix[-1] + 1,)
+        ceiling += (0,) * max(0, 3 - len(ceiling))
+        return want <= have < ceiling
     return False
 
 

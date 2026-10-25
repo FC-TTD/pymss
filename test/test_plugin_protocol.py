@@ -114,9 +114,21 @@ modes = ["rendered_preview", "offline_export"]
         self.assertTrue(satisfies("1.2.0", ">=1,<2"))
         self.assertTrue(satisfies("1.2", "==1.2.0"))
         self.assertTrue(satisfies("1.2.3", "~=1.2"))
-        self.assertFalse(satisfies("1.3.0", "~=1.2"))
+        self.assertTrue(satisfies("1.3.0", "~=1.2"))
+        self.assertFalse(satisfies("2.0.0", "~=1.2"))
         self.assertFalse(satisfies("2.0.0", "<2"))
         self.assertFalse(satisfies("1.0.0", ">=1.5"))
+
+    def test_compatible_release_preserves_the_full_lower_bound_and_prefix(self):
+        for version, constraint, expected in [
+            ("1.4.0", "~=1.4.5", False), ("1.4.5", "~=1.4.5", True),
+            ("1.4.9", "~=1.4.5", True), ("1.5.0", "~=1.4.5", False),
+            ("1.9.0", "~=1.4", True), ("2.0.0", "~=1.4", False),
+            ("1.4.5.0", "~=1.4.5.1", False), ("1.4.5.1", "~=1.4.5.1", True),
+            ("1.4.6", "~=1.4.5.1", False), ("1.4.5.0", "==1.4.5", True),
+        ]:
+            with self.subTest(version=version, constraint=constraint):
+                self.assertEqual(satisfies(version, constraint), expected)
 
 
 class LifecycleTests(unittest.TestCase):
@@ -406,6 +418,40 @@ class LifecycleTests(unittest.TestCase):
         failed = next(row for row in plugins.get_last_report().failed if row.name == "future")
         self.assertIn("api_version 999", failed.error)
 
+    def test_failed_entrypoint_restores_operations_and_global_registrations(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from pymss.plugins import PluginRegistration, get_registry
+        from pymss.plugins.loader import PluginLoadReport, _scan_entrypoints
+
+        registry = get_registry()
+        registry.register_capability("ep_shared", lambda: "original", source="existing")
+        original = registry.capabilities["ep_shared"]
+        nodes_before, cli_before = dict(registry.nodes), list(registry.cli_commands)
+        runtime = ops.Runtime()
+        ops._DEFAULT_RUNTIME = runtime
+
+        def fail():
+            plugin = PluginRegistration(source="broken-entrypoint")
+            plugin.register_capability("ep_shared", lambda: "replacement")
+            plugin.register_node("EntrypointNode", lambda *args: None)
+            plugin.register_cli(("broken", "ep"), lambda args: 0)
+            plugin.register_operation(id="author.entrypoint", inputs={}, params={"type": "object"},
+                                      outputs={}, run=lambda c, i, p: {})
+            raise RuntimeError("entrypoint import failed")
+
+        entries = Mock()
+        entries.select.return_value = [SimpleNamespace(name="broken", load=fail)]
+        report = PluginLoadReport()
+        with patch("pymss.plugins.loader.entry_points", return_value=entries):
+            _scan_entrypoints(report)
+        self.assertFalse(report.results[0].loaded)
+        self.assertIn("entrypoint import failed", report.results[0].error)
+        self.assertEqual(runtime.list_operations(), [])
+        self.assertIs(registry.capabilities["ep_shared"], original)
+        self.assertEqual(registry.nodes, nodes_before)
+        self.assertEqual(registry.cli_commands, cli_before)
+
 
 class GraphOperationTests(unittest.TestCase):
     def setUp(self):
@@ -455,6 +501,8 @@ class GraphOperationTests(unittest.TestCase):
         for overrides in [
             {"audio_input": {"node": "999"}},
             {"audio_input": {"node": "1", "widget": -1}},
+            {"audio_input": {"node": "1", "widget": 99}},
+            {"audio_input": {"node": "2", "widget": 0}},
             {"param_bindings": {"gain": {"nodes": ["999"]}}},
             *({"param_bindings": {"gain": {"nodes": ["2"], "widget": index}}} for index in [-1, 99, True]),
             *({"outputs": {"audio": {"node": "2", "output": slot}}} for slot in [-1, 1, 99, "0", True]),
@@ -464,6 +512,18 @@ class GraphOperationTests(unittest.TestCase):
                     "graph_file": path, "audio_input": {"node": "1"},
                     "outputs": {"audio": {"node": "2"}}, **overrides,
                 })
+
+    def test_file_and_runtime_name_input_widgets_both_bind_the_supplied_audio(self):
+        import numpy as np
+        from pymss.graph.core import numpy_to_audio
+
+        for widget in [0, 1]:
+            with self.subTest(widget=widget):
+                run = build_graph_operation(graph_file=self.graph(),
+                                            audio_input={"node": "1", "widget": widget},
+                                            outputs={"audio": {"node": "2"}})
+                result = run(None, {"audio": numpy_to_audio(np.full((2, 1000), 0.25, dtype=np.float32), 44100)}, {})
+                self.assertAlmostEqual(float(result["audio"].audio.mean()), 0.25, places=4)
 
     def test_distinct_output_slots_are_lifted_without_leaking_scratch_files(self):
         import numpy as np

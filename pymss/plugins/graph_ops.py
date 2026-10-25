@@ -54,7 +54,7 @@ def build_graph_operation(
     outputs = dict(outputs)
 
     def _prepare(dag: Any) -> tuple[int, Any, dict[str, Any], dict[str, Any]]:
-        load_nodes = [n for n in dag.nodes if str(n.type).startswith("pymss_load_audio")]
+        load_nodes = [n for n in dag.nodes if str(n.type) in {"pymss_load_audio", "LoadAudio"}]
         binding = dict(audio_input or {})
         node_ref = binding.get("node")
         if node_ref is None:
@@ -64,9 +64,11 @@ def build_graph_operation(
                 )
             node_ref = load_nodes[0].id
         input_node = _node_index(dag, str(node_ref))
+        if input_node not in {node.id for node in load_nodes}:
+            raise DAGError("audio_input.node must reference a single-audio load node")
         widget = binding.get("widget", 0)
-        if type(widget) is not int or widget < 0:
-            raise DAGError("audio input widget must be a non-negative integer")
+        if type(widget) is not int or widget not in {0, 1}:
+            raise DAGError("audio input widget must be 0 (file path) or 1 (runtime input name)")
         input_name = str(binding.get("name") or "audio")
 
         bound_params: dict[str, tuple[list[int], int | None]] = {}
@@ -120,13 +122,15 @@ def build_graph_operation(
         # input_name widget to our key and pass the materialized file via
         # inputs={key: path}. This is the same channel pymss-studio uses.
         input_key = f"__pymss_op_input_{input_name}"
+        input_path = _audio_ref(waveform, sr, scratch)
         widgets = list((node.data.get("widgets_values") or []))
         while len(widgets) < 2:
             widgets.append("")
-        widgets[1] = input_key
+        widgets[widget] = input_path if widget == 0 else input_key
+        if widget == 0:
+            widgets[1] = ""
         node.data = dict(node.data or {})
         node.data["widgets_values"] = widgets
-        input_path = _audio_ref(waveform, sr, scratch)
 
         for pname, (node_ids, widget_index) in bindings["params"].items():
             if pname not in params:

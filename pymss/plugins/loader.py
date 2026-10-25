@@ -105,6 +105,9 @@ def _scan_entrypoints(report: PluginLoadReport) -> None:
     except AttributeError:
         group_eps = list(eps.get(ENTRYPOINT_GROUP, []))  # type: ignore[union-attr]
     for ep in group_eps:
+        from ..operations import _RuntimePluginHandle, default_runtime
+
+        handle = _RuntimePluginHandle(default_runtime(), source=f"entrypoint:{ep.name}")
         try:
             ep.load()
             report.results.append(
@@ -112,6 +115,7 @@ def _scan_entrypoints(report: PluginLoadReport) -> None:
             )
             logger.debug("loaded entrypoint plugin '%s'", ep.name)
         except Exception as exc:  # noqa: BLE001
+            handle.rollback()
             report.results.append(
                 PluginLoadResult(
                     name=ep.name,
