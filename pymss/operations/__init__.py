@@ -191,6 +191,7 @@ class Runtime:
 
     _operations: dict[str, _OperationEntry] = field(default_factory=dict)
     _load_report: list[dict[str, Any]] = field(default_factory=list)
+    _manifest_plugin_dirs: dict[str, str] = field(default_factory=dict)
 
     # ---- registration ----
 
@@ -279,13 +280,23 @@ class Runtime:
             from ..plugins.lifecycle import PluginManager, pymss_package_version
 
             manager = PluginManager(root)
-            manager.discover()
+            states = manager.discover()
+            for state in states:
+                if state.manifest is None:
+                    continue
+                plugin_id = state.manifest.plugin_id
+                previous = self._manifest_plugin_dirs.get(plugin_id)
+                if previous is not None and previous != str(state.directory.resolve()):
+                    state.status = "blocked"
+                    state.error = f"duplicate plugin id {plugin_id!r}: already activated from {previous}"
             manager.resolve(pymss_version=pymss_package_version())
             rows = manager.activate(lambda source: _RuntimePluginHandle(self, source=source))
             for row in rows:
                 name = row.get("name")
                 if isinstance(name, str):
                     manifest_rows[name] = row
+                    if row.get("loaded"):
+                        self._manifest_plugin_dirs[row["plugin_id"]] = str((root / name).resolve())
         except Exception as exc:  # noqa: BLE001 — lifecycle must not break legacy loading
             self._load_report.append(
                 {"name": "<plugin-lifecycle>", "loaded": False, "error": f"{type(exc).__name__}: {exc}"}

@@ -163,9 +163,18 @@ class PluginManager:
     def resolve(self, *, pymss_version: str | None = None) -> list[PluginState]:
         """Resolve dependency graph; mark unsatisfiable plugins blocked."""
         by_id: dict[str, PluginState] = {}
+        duplicates: dict[str, list[PluginState]] = {}
         for state in self._states.values():
             if state.manifest is not None:
-                by_id.setdefault(state.manifest.plugin_id, state)
+                plugin_id = state.manifest.plugin_id
+                if plugin_id in by_id:
+                    duplicates.setdefault(plugin_id, [by_id[plugin_id]]).append(state)
+                else:
+                    by_id[plugin_id] = state
+        for plugin_id, states in duplicates.items():
+            error = f"duplicate plugin id {plugin_id!r}: {', '.join(state.name for state in states)}"
+            for state in states:
+                state.status, state.error = "blocked", error
 
         def check(state: PluginState, seen: tuple[str, ...]) -> None:
             if state.status in {"resolved", "blocked"}:

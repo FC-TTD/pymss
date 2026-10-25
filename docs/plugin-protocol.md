@@ -101,13 +101,15 @@ plugin.register_operation(
     run=build_graph_operation(
         graph_file=Path(__file__).parent / "graphs/chain.json",
         audio_input={"node": "1", "widget": 0, "name": "audio"},   # 输入音频→load 节点
-        param_bindings={"gain_db": {"nodes": ["2"]}},               # 参数→目标节点 data["params"]
+        param_bindings={"gain_db": {"nodes": ["2"], "widget": 0}},  # 参数→音量节点第一个 widget
         outputs={"audio": {"node": "4", "output": 0}},              # 指定节点输出→命名输出
     ),
 )
 ```
 
 执行语义：加载 comfy JSON → 应用输入/参数绑定 → `run_dag` → 按声明提取输出。绑定失败（节点缺失等）在安装/激活时即报错，而非运行时崩溃。
+
+参数绑定始终写入目标节点的 `data["params"]`。内置 Comfy 节点使用 `widgets_values`，因此需指定 `widget`，其索引必须是图中已存在的非负整数位置；省略时保留仅写 `data["params"]` 的插件节点行为。输出端口必须存在，不会回退到其他端口。每次执行使用独立临时目录，完成或失败后清理。
 
 ## 6. Studio SDK（消息协议）
 

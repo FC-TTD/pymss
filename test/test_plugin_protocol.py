@@ -224,6 +224,47 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("failed to activate", by_id["author.user"]["error"])
         self.assertEqual([op["id"] for op in runtime.list_operations()], [])
 
+    def test_duplicate_plugin_ids_block_all_providers_and_dependents(self):
+        for first, second in [("1.0.0", "9.0.0"), ("9.0.0", "1.0.0"), ("9.0.0", "9.0.0")]:
+            with self.subTest(versions=(first, second)):
+                self.plugin("first", "author.provider", first, broken=True)
+                self.plugin("second", "author.provider", second, broken=True)
+                self.plugin("consumer", "author.consumer", "1.0.0", deps={"author.provider": ">=9"})
+                manager = PluginManager(self.root)
+                manager.discover()
+                manager.resolve()
+                with patch("pymss.operations._RuntimePluginHandle") as factory:
+                    report = manager.activate(factory)
+                factory.assert_not_called()
+                self.assertEqual({row["status"] for row in report}, {"blocked"})
+                for row in report:
+                    self.assertIn("duplicate plugin id", row["error"])
+                    self.assertIn("first, second", row["error"])
+
+    def test_duplicate_plugin_id_from_a_second_root_preserves_the_active_provider(self):
+        original = self.plugin("original", "author.shared", "1.0.0", body=(
+            "def setup(plugin):\n"
+            "    plugin.register_operation(id='author.original', inputs={}, params={'type':'object'}, "
+            "outputs={}, run=lambda c,i,p: {'value': 1})\n"
+        ))
+        runtime = ops.Runtime()
+        self.assertTrue(runtime.load_plugins()[0]["loaded"])
+        second_root = self.root / "managed"
+        duplicate = second_root / "duplicate"
+        duplicate.mkdir(parents=True)
+        (duplicate / "pyproject.toml").write_text((original / "pyproject.toml").read_text(encoding="utf-8"), encoding="utf-8")
+        (duplicate / "__init__.py").write_text(
+            "def setup(plugin):\n"
+            "    plugin.register_operation(id='author.duplicate', inputs={}, params={'type':'object'}, "
+            "outputs={}, run=lambda c,i,p: {'value': 2})\n", encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"PYMSS_PLUGINS_DIR": str(second_root)}):
+            report = runtime.load_plugins()
+        self.assertEqual(report[0]["status"], "blocked")
+        self.assertIn("already activated from", report[0]["error"])
+        self.assertEqual([entry["id"] for entry in runtime.list_operations()], ["author.original"])
+        self.assertEqual(runtime.run("author.original", inputs={}, params={}), {"value": 1})
+
     def test_future_api_version_is_blocked_not_crashed(self):
         directory = self.root / "future"
         directory.mkdir(parents=True)
@@ -377,7 +418,7 @@ class GraphOperationTests(unittest.TestCase):
             "nodes": [
                 {"id": 1, "type": "pymss_load_audio", "widgets_values": [None, "input"],
                  "inputs": [], "outputs": [{"name": "audio"}], "pos": [0, 0]},
-                {"id": 2, "type": "AudioAdjustVolume", "widgets_values": [6],
+                {"id": 2, "type": "AudioAdjustVolume", "widgets_values": [0],
                  "inputs": [{"name": "audio", "type": "AUDIO", "link": 1}, {"name": "volume", "type": "INT", "link": 2}],
                  "outputs": [{"name": "audio"}], "pos": [0, 0]},
             ],
@@ -393,28 +434,87 @@ class GraphOperationTests(unittest.TestCase):
         run = build_graph_operation(
             graph_file=self.graph(),
             audio_input={"node": "1", "widget": 0, "name": "audio"},
-            param_bindings={"gain": {"nodes": ["2"]}},
+            param_bindings={"gain": {"nodes": ["2"], "widget": 0}},
             outputs={"audio": {"node": "2", "output": 0}},
         )
         waveform = np.ones((2, 4410), dtype=np.float32) * 0.1
         from pymss.graph.core import numpy_to_audio
-        result = run(None, {"audio": numpy_to_audio(waveform, 44100)}, {"gain": 1.0})
+        result = run(None, {"audio": numpy_to_audio(waveform, 44100)}, {"gain": 6.0})
         out = result["audio"]
         data, sr = out.audio, out.sample_rate
         self.assertEqual(sr, 44100)
         # The volume widget is dB: +6 dB ≈ ×1.995
         self.assertAlmostEqual(float(np.abs(data).max()), 0.1 * 10 ** (6 / 20), places=4)
+        second = run(None, {"audio": numpy_to_audio(waveform, 44100)}, {"gain": -6.0})
+        self.assertAlmostEqual(float(np.abs(second["audio"].audio).max()), 0.1 * 10 ** (-6 / 20), places=4)
 
-    def test_binding_errors_raise_at_build_or_run_not_silently(self):
-        run = build_graph_operation(
-            graph_file=self.graph(),
-            audio_input={"node": "999", "widget": 0, "name": "audio"},
-            outputs={"audio": {"node": "2"}},
-        )
-        from pymss.graph.core import numpy_to_audio
+    def test_binding_errors_are_rejected_at_build_time(self):
+        from pymss.graph.core import DAGError
+
+        path = self.graph()
+        for overrides in [
+            {"audio_input": {"node": "999"}},
+            {"audio_input": {"node": "1", "widget": -1}},
+            {"param_bindings": {"gain": {"nodes": ["999"]}}},
+            *({"param_bindings": {"gain": {"nodes": ["2"], "widget": index}}} for index in [-1, 99, True]),
+            *({"outputs": {"audio": {"node": "2", "output": slot}}} for slot in [-1, 1, 99, "0", True]),
+        ]:
+            with self.subTest(overrides=overrides), self.assertRaises(DAGError):
+                build_graph_operation(**{
+                    "graph_file": path, "audio_input": {"node": "1"},
+                    "outputs": {"audio": {"node": "2"}}, **overrides,
+                })
+
+    def test_distinct_output_slots_are_lifted_without_leaking_scratch_files(self):
         import numpy as np
-        with self.assertRaises(Exception):
-            run(None, {"audio": numpy_to_audio(np.zeros((1, 10), dtype=np.float32), 44100)}, {})
+        from pymss.graph.core import numpy_to_audio
+
+        path = self.graph()
+        graph = json.loads(path.read_text(encoding="utf-8"))
+        graph["nodes"][1] = {
+            "id": 2, "type": "SplitAudioChannels", "widgets_values": [],
+            "inputs": [{"name": "audio", "link": 1}],
+            "outputs": [{"name": "left"}, {"name": "right"}],
+        }
+        graph["links"] = graph["links"][:1]
+        path.write_text(json.dumps(graph), encoding="utf-8")
+        run = build_graph_operation(graph_file=path, audio_input={"node": "1"}, outputs={
+            "left": {"node": "2", "output": 0}, "right": {"node": "2", "output": 1},
+        })
+        scratch = self.root / "scratch"
+        result = run(ops.OperationContext(workdir=str(scratch)), {"audio": numpy_to_audio(
+            np.stack([np.full(1000, 0.1), np.full(1000, 0.7)]).astype(np.float32), 44100,
+        )}, {})
+        self.assertAlmostEqual(float(result["left"].audio.mean()), 0.1, places=4)
+        self.assertAlmostEqual(float(result["right"].audio.mean()), 0.7, places=4)
+        self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_concurrent_graph_operations_keep_inputs_isolated_and_clean_up(self):
+        import numpy as np
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        from pymss.graph.core import numpy_to_audio
+        from pymss.plugins import graph_ops
+
+        run = build_graph_operation(graph_file=self.graph(), audio_input={"node": "1"},
+                                    outputs={"audio": {"node": "2"}})
+        materialize = graph_ops._audio_ref
+        barrier = Barrier(2)
+
+        def synchronized(*args):
+            path = materialize(*args)
+            barrier.wait(timeout=5)
+            return path
+
+        scratch = self.root / "scratch"
+        context = ops.OperationContext(workdir=str(scratch))
+        with patch.object(graph_ops, "_audio_ref", side_effect=synchronized), ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda level: run(context, {"audio": numpy_to_audio(
+                np.full((2, 1000), level, dtype=np.float32), 44100,
+            )}, {}), [0.1, 0.7]))
+        for result, level in zip(results, [0.1, 0.7]):
+            self.assertAlmostEqual(float(result["audio"].audio.mean()), level, places=4)
+        self.assertEqual(list(scratch.iterdir()), [])
 
 
 if __name__ == "__main__":

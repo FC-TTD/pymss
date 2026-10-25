@@ -11,15 +11,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Mapping
 
 from ..graph.core import AudioArtifact, DAGError, audio_to_numpy, numpy_to_audio
-
-# Per-run materialized input files, keyed by the runtime-input name handed to
-# run_dag(inputs=...). Populated inside _run; keyed lookup avoids re-writing
-# the same file for repeated invocations of one operation.
-_audio_paths: dict[str, str] = {}
-
 
 def _node_index(dag: Any, node_ref: str) -> int:
     try:
@@ -49,6 +44,7 @@ def build_graph_operation(
             graph has exactly one load node, ``node`` may be omitted.
         param_bindings: operation param name -> ``{"nodes": [<id>...]}`` —
             each target node receives the param in ``node.data["params"]``.
+            Add ``"widget": <index>`` to also replace an existing widget value.
         outputs: output name -> ``{"node": <id>, "output": <slot>}`` —
             the node whose executed output becomes the named operation output.
     """
@@ -69,26 +65,45 @@ def build_graph_operation(
             node_ref = load_nodes[0].id
         input_node = _node_index(dag, str(node_ref))
         widget = binding.get("widget", 0)
+        if type(widget) is not int or widget < 0:
+            raise DAGError("audio input widget must be a non-negative integer")
         input_name = str(binding.get("name") or "audio")
 
-        bound_params: dict[str, list[int]] = {}
+        bound_params: dict[str, tuple[list[int], int | None]] = {}
         for pname, target in param_bindings.items():
             nodes = target.get("nodes") if isinstance(target, Mapping) else None
             if not isinstance(nodes, list) or not nodes:
                 raise DAGError(f"param binding for {pname!r} needs a non-empty 'nodes' list")
-            bound_params[pname] = [_node_index(dag, str(n)) for n in nodes]
+            node_ids = [_node_index(dag, str(n)) for n in nodes]
+            widget_index = target.get("widget")
+            if widget_index is not None:
+                if type(widget_index) is not int or widget_index < 0:
+                    raise DAGError(f"param binding for {pname!r} needs a non-negative widget index")
+                for node_id in node_ids:
+                    target_node = next(node for node in dag.nodes if node.id == node_id)
+                    if widget_index >= len(target_node.data.get("widgets_values") or []):
+                        raise DAGError(f"param binding for {pname!r} references missing widget {widget_index} on node {node_id}")
+            bound_params[pname] = (node_ids, widget_index)
 
         bound_outputs: dict[str, tuple[int, int]] = {}
         for name, target in outputs.items():
             if not isinstance(target, Mapping) or "node" not in target:
                 raise DAGError(f"output {name!r} needs a 'node' (and optional 'output' slot)")
-            bound_outputs[name] = (
-                _node_index(dag, str(target["node"])),
-                int(target.get("output", 0)),
-            )
+            node_id = _node_index(dag, str(target["node"]))
+            slot = target.get("output", 0)
+            node = next(node for node in dag.nodes if node.id == node_id)
+            output_count = max(len(node.signature.output_names), len(node.signature.output_types),
+                               len(node.data.get("outputs") or []))
+            if type(slot) is not int or not 0 <= slot < output_count:
+                raise DAGError(f"output {name!r} references invalid output slot {slot!r} on node {node_id}")
+            bound_outputs[name] = (node_id, slot)
         return input_node, widget, input_name, {"params": bound_params, "outputs": bound_outputs}
 
-    def _run(ctx: Any, inputs: Mapping[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
+    from ..graph.comfy_loader import load_comfy_graph
+
+    _prepare(load_comfy_graph(data))
+
+    def _execute(ctx: Any, inputs: Mapping[str, Any], params: Mapping[str, Any], scratch: Path) -> dict[str, Any]:
         import numpy as np
 
         from ..graph.comfy_loader import load_comfy_graph
@@ -111,9 +126,9 @@ def build_graph_operation(
         widgets[1] = input_key
         node.data = dict(node.data or {})
         node.data["widgets_values"] = widgets
-        _audio_ref(ctx, waveform, sr, input_key)
+        input_path = _audio_ref(waveform, sr, scratch)
 
-        for pname, node_ids in bindings["params"].items():
+        for pname, (node_ids, widget_index) in bindings["params"].items():
             if pname not in params:
                 continue
             for node_id in node_ids:
@@ -122,12 +137,16 @@ def build_graph_operation(
                 merged[pname] = params[pname]
                 node.data = dict(node.data or {})
                 node.data["params"] = merged
+                if widget_index is not None:
+                    widgets = list(node.data["widgets_values"])
+                    widgets[widget_index] = params[pname]
+                    node.data["widgets_values"] = widgets
 
         node_results: dict[int, Any] = {}
-        result = run_dag(
+        run_dag(
             dag,
-            output_dir=str(_scratch_dir(ctx)),
-            inputs={input_key: _audio_paths[input_key]},
+            output_dir=str(scratch),
+            inputs={input_key: input_path},
             logger=getattr(ctx, "logger", None),
             node_results=node_results,
         )
@@ -135,35 +154,30 @@ def build_graph_operation(
         lifted: dict[str, Any] = {}
         for name, (node_id, slot) in bindings["outputs"].items():
             record = node_results.get(node_id)
-            value = None
-            if record is not None:
-                outputs_map = getattr(record, "outputs", None)
-                if outputs_map is not None:
-                    value = outputs_map.get(slot, next(iter(outputs_map.values()), None))
+            outputs_map = getattr(record, "outputs", {}) if record is not None else {}
+            if slot not in outputs_map:
+                raise DAGError(f"node {node_id} did not produce declared output slot {slot} for {name!r}")
+            value = outputs_map[slot]
             if isinstance(value, AudioArtifact):
                 lifted[name] = numpy_to_audio(value.audio, value.sample_rate)
             else:
                 lifted[name] = value
         return lifted
 
+    def _run(ctx: Any, inputs: Mapping[str, Any], params: Mapping[str, Any]) -> dict[str, Any]:
+        parent = getattr(ctx, "scratch_dir", None) or getattr(ctx, "workdir", None)
+        if parent is not None:
+            Path(parent).mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="pymss-graph-op-", dir=parent) as directory:
+            return _execute(ctx, inputs, params, Path(directory))
+
     return _run
 
 
-def _scratch_dir(ctx: Any) -> Path:
-    scratch = getattr(ctx, "scratch_dir", None)
-    if scratch is not None:
-        directory = Path(scratch)
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory
-    import tempfile
-
-    return Path(tempfile.mkdtemp(prefix="pymss-graph-op-"))
-
-
-def _audio_ref(ctx: Any, waveform: Any, sr: int, key: str) -> None:
+def _audio_ref(waveform: Any, sr: int, directory: Path) -> str:
     """Materialize the input waveform into the per-run scratch dir."""
     import soundfile as sf
 
-    path = _scratch_dir(ctx) / f"{key}.wav"
+    path = directory / "input.wav"
     sf.write(path, waveform.T if waveform.ndim > 1 else waveform, sr)
-    _audio_paths[key] = str(path)
+    return str(path)
