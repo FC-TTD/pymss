@@ -1445,7 +1445,7 @@ requires-dist = [
     { name = "librosa", specifier = ">=0.10.2" },
     { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.0" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "pymss-core", specifier = "==0.1.12" },
+    { name = "pymss-core", specifier = "==0.1.14" },
     { name = "pysocks", marker = "extra == 'proxy'", specifier = ">=1.7.1,<2" },
     { name = "pyyaml", specifier = ">=6.0.1" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.7.1" },
@@ -1464,7 +1464,7 @@ dev = [
 
 [[package]]
 name = "pymss-core"
-version = "0.1.12"
+version = "0.1.14"
 source = { registry = "https://mirrors.cernet.edu.cn/pypi/web/simple" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://mirrors.cernet.edu.cn/pypi/web/simple" }, marker = "python_full_version < '3.11'" },
@@ -1473,9 +1473,9 @@ dependencies = [
     { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { name = "torch", version = "2.12.0", source = { registry = "https://mirrors.cernet.edu.cn/pypi/web/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
 ]
-sdist = { url = "https://mirror.nju.edu.cn/pypi/web/packages/93/08/7ad505aba690f73bb811f94e9f45007b5ebfef5a7fc8cd0ac109e43e6c2c/pymss_core-0.1.12.tar.gz", hash = "sha256:088670f0576b3f2cd85ed1d8fc57da0d1007b80910a3fef985153f5d60c2fe9f" }
+sdist = { url = "https://files.pythonhosted.org/packages/2b/fb/70618f1659df104e5a59a06b4ad57e1d69bc22def632622d7db39b677f83/pymss_core-0.1.14.tar.gz", hash = "sha256:4e581f5d578f004bed7c353ed2aea8fcd5effde94ca6cd2291f5bf740fe4f737" }
 wheels = [
-    { url = "https://mirror.nju.edu.cn/pypi/web/packages/60/37/6e321932bbf60c68e7a172020e33db9302f84b926a1dd3c4287a36dd448f/pymss_core-0.1.12-py3-none-any.whl", hash = "sha256:7ae6ace8760e28a023c29c7d88918968e944908044a672176a9bb54d916e095f" },
+    { url = "https://files.pythonhosted.org/packages/60/85/c847ed9d41454ffcd1932cf26b5084ca26f8982e43701a511ab783291bcd/pymss_core-0.1.14-py3-none-any.whl", hash = "sha256:10068f6591b7328a9c7cb7cd42858371664892a6c7e1f0b868be45925270049d" },
 ]
 
 [[package]]
