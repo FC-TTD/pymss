@@ -664,8 +664,7 @@ def _finalize_overlap(result, counter, length_init, border):
             source = source / counter[..., offset:chunk_end]
         estimated_sources_t[..., offset:chunk_end].copy_(source)
     estimated_sources = estimated_sources_t.numpy()
-    if divide_counter:
-        np.nan_to_num(estimated_sources, copy=False, nan=0.0)
+    np.nan_to_num(estimated_sources, copy=False, nan=0.0)
     return estimated_sources
 
 
