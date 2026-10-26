@@ -952,7 +952,8 @@ def _mlx_warmup_forward(model, batch_size, channels, length, dtype):  # one thro
 
 
 def warmup_mlx_full(model, config):
-    # Materialize weights, then warm the real batch shape once.
+    # Known channels can validate/materialize the real shape directly. Probe
+    # short shapes only when the input channel count or real shape is unknown.
     try:
         import mlx.core as mx
     except Exception as exc:
@@ -967,7 +968,8 @@ def warmup_mlx_full(model, config):
     selected_channels, last_error = None, None
 
     try:
-        for length in _mlx_warmup_length_candidates(model):
+        lengths = () if chunk_size and len(channel_candidates) == 1 else _mlx_warmup_length_candidates(model)
+        for length in lengths:
             for channels in channel_candidates:
                 try:
                     _mlx_warmup_forward(model, 1, channels, length, mx_dtype)
