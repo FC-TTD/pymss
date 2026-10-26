@@ -146,8 +146,6 @@ def _select_device(device, device_ids, logger):
     if device not in ["cpu", "mps"]:
         cuda_available = torch.cuda.is_available()
         if device == "cuda" and not cuda_available:
-            if _npu_runtime_available():
-                raise RuntimeError("device='cuda' requested but only an Ascend NPU is available; use --device npu")
             raise RuntimeError("device='cuda' requires a CUDA or ROCm-enabled PyTorch build with an available GPU")
         if cuda_available:
             if not isinstance(device_ids, (list, tuple)) or not device_ids or any(

@@ -24,7 +24,7 @@ def _hann_window(n_fft, dtype, device):
     if window is None:
         if torch_device.type == "npu":
             # torch_npu's hann_window hits an int64/float cast bug on device.
-            window = torch.hann_window(n_fft, dtype=dtype).to(torch_device)
+            window = torch.hann_window(n_fft, dtype=dtype, device="cpu").to(torch_device)
         else:
             window = torch.hann_window(n_fft, dtype=dtype, device=torch_device)
         _HANN_WINDOW_CACHE[key] = window
@@ -203,8 +203,10 @@ def _torch_stft(wave, n_fft, hop_length, device):
     device_type = None if device is None else torch.device(device).type
     if device_type not in ("cuda", "npu"):
         return None
-    wave_t = torch.from_numpy(np.ascontiguousarray(wave)).to(device).float()
-    window = _hann_window(n_fft, torch.float32, device)
+    wave_t = torch.from_numpy(np.ascontiguousarray(wave)).to(device)
+    if device_type == "npu":
+        wave_t = wave_t.float()
+    window = _hann_window(n_fft, wave_t.dtype, device)
     if device_type == "npu":
         from pymss_core.npu_fft import stft_npu
 

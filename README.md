@@ -30,20 +30,19 @@ WSL2 (RDNA3/RDNA4) can follow the Linux steps instead.
 
 ### Ascend NPU
 
-
-
 pymss runs on Huawei Ascend NPUs through `torch_npu`. Install the Ascend PyTorch adapter matching
-your CANN toolkit and torch build (see the [Ascend torch_npu compatibility matrix](https://github.com/Ascend/pytorch#readme)), then:
+your CANN toolkit and torch build (see the [Ascend torch_npu compatibility matrix](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md)).
+Choose a combination with PyTorch 2.7.1 or later, then install pymss:
 
 ```sh
-pip install torch==<torch_npu-matched-version> torch_npu==<version>
 pip install pymss
 ```
 
-Use `--device npu` (or `device="auto"`, which prefers CUDA, then NPU, then MPS). On NPU the
-STFT/ISTFT pipeline uses an in-device implementation built on `torch.fft` primitives, and
-recurrent cells (LSTM/GRU, used by bandit/scnet/VR-5.x models) transparently bounce through CPU
-because torch_npu does not ship aclnn kernels for them yet.
+Use `--device npu` (or `device="auto"`, which prefers CUDA, then NPU, then Apple Silicon).
+`--device-id` selects the NPU index; if multiple IDs are supplied, only the first is used.
+Multi-NPU parallel execution is not supported. On NPU, STFT/ISTFT uses `torch.fft` primitives.
+RNN/LSTM/GRU layers use a CPU inference fallback for affected `torch_npu` builds, with results
+returned to the NPU. This fallback does not support training and adds CPU transfer overhead.
 
 For CLI and Python API usage, install:
 

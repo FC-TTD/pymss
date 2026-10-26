@@ -12,14 +12,13 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
 ### 昇腾 NPU（Ascend）
 
-pymss 通过 `torch_npu` 支持华为昇腾 NPU。请先安装与 CANN 工具链及 torch 版本匹配的昇腾 PyTorch 适配器（参见 [Ascend torch_npu 兼容性矩阵](https://github.com/Ascend/pytorch#readme)），然后：
+pymss 通过 `torch_npu` 支持华为昇腾 NPU。请先安装与 CANN 工具链及 torch 版本匹配的昇腾 PyTorch 适配器（参见 [Ascend torch_npu 兼容性矩阵](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md)），选择 PyTorch 2.7.1 或更高版本的组合，再安装 pymss：
 
 ```sh
-pip install torch==<与torch_npu匹配的版本> torch_npu==<版本>
 pip install pymss
 ```
 
-使用 `--device npu`（或 `device="auto"`，其优先级为 CUDA → NPU → MPS）。NPU 上的 STFT/ISTFT 使用基于 `torch.fft` 原语的设备内实现；循环神经网络单元（LSTM/GRU，用于 bandit/scnet/VR-5.x 模型）因 torch_npu 暂未提供 aclnn 算子，会透明地回退到 CPU 执行。
+使用 `--device npu`（或 `device="auto"`，其优先级为 CUDA → NPU → Apple Silicon）。`--device-id` 指定 NPU 编号；传入多个编号时仅使用第一项，目前不支持多 NPU 并行。NPU 上的 STFT/ISTFT 使用基于 `torch.fft` 原语的设备内实现；针对相关 `torch_npu` 版本，RNN/LSTM/GRU 循环层使用 CPU 推理回退，结果返回 NPU。此回退不支持训练，并会增加 CPU 数据传输开销。
 
 ### AMD ROCm
 
