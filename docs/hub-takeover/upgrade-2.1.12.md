@@ -96,8 +96,11 @@ The active evidence index is `docs/spec/jobs/2026-10-28-pymss-upstream/tasks.md`
 - Candidate GPU: 14 successful runs cover nine defaults, mono preservation,
   explicit mono/stereo, PCM16/24/32/FLOAT, 16/32/44.1/48 kHz, and a 67.5-second
   FX input with a partial tail. The SDK child exits naturally on unload and
-  reports an empty process group. A separate 27-run export matrix is recorded
-  in the evidence index.
+  reports an empty process group. All nine profiles also pass a 27-run export
+  matrix: mono/source/16 kHz/PCM16,
+  stereo-to-mono/44.1 kHz/FLOAT and mono-to-stereo/32 kHz/PCM32. A real HTTP
+  mixed mono/stereo batch at 22.05 kHz/PCM16 preserves one/two channels per input;
+  actual media, result metadata and hashes match.
 - Real-checkpoint Bandit test: core 0.1.14 still returns the wrong batch axis
   for two channels and raises for batch=2/channels=2/500003 samples. The adapter
   returns correct shapes; native mono output exactly matches raw core output.
@@ -108,7 +111,10 @@ The active evidence index is `docs/spec/jobs/2026-10-28-pymss-upstream/tasks.md`
   waits for actual work, active unload returns resource_busy, a model switch
   drains inference, batch cancellation settles, and final unload exits the child.
   This cancellation probe simulates caller cancellation at ASGI, rather than
-  claiming a macOS network-disconnect test.
+  claiming a macOS network-disconnect test. A separate final-image probe
+  sends an actual long-audio HTTP request over TCP, closes the socket while
+  GPU work is active, verifies unload is rejected and a model switch waits,
+  then observes successful drain and empty child process group on unload.
 - Browser UI: actual inherited administrator assets load, upload a real source,
   produce three FX tracks, play audio and download all three verified stereo
   48 kHz PCM24 WAVs, with no page errors. No UI source or published assets changed.
@@ -138,7 +144,50 @@ separate budget calibration including allocator/context headroom. All task-owned
 GPU processes must stop before cleanup. Other sessions' formal instances remain
 untouched.
 
-Real mac-dev Dayan client/UI acceptance remains an explicit delivery gate until
-its job-local smoke report receives an independent artifact-consistency verdict.
-At this stage SSH and task-only Gateway routing work; macOS accessibility/window
-access is pending. This is not a passed Dayan smoke claim.
+Real Dayan client/UI acceptance remains an explicit delivery gate until its
+job-local smoke report receives an independent artifact-consistency verdict.
+The user replaced mac-dev with Windows89 after macOS denied accessibility.
+The task-launched macOS process and tunnel were stopped and its task-touched
+configuration restored to the prior hash. No macOS smoke pass is claimed.
+
+Windows89 acceptance uses the **unchanged installed** Dayan beta11 executable,
+SHA256 `4ed76248640c328c609f6cd3c9b6318b61605ef407fd57ced65453b303328979`,
+and the already-published beta16 runtime. A briefly prepared isolation build was
+canceled; no rebuilt client was used. The user authorized killing the hung prior
+Dayan process, exiting DaVinci and testing only the file-based Dayan path on the
+resource-constrained VM. No DaVinci integration acceptance is claimed.
+
+The actual native picker selected the existing `月光青石巷.mp3` test source
+(162 seconds), rather than the initially intended 7.5-second fixture. Through the
+actual UI, select FX and click Start once. The unchanged native transport reaches
+an isolated test-only build of Gateway main `7d4cdb7`, which calls the final-source
+provider and actual SDK/GPU/weights. All three roles (dialogue/music/fx) are retained,
+only fx is selected by default, and native materialization completes. Exact native
+FileRef resolution and Windows ffprobe/SHA256 checks confirm all three files are
+162-second WAV/48kHz/PCM24/stereo, each 46656044 bytes, matching result metadata.
+The actual result player advances to 30.34 seconds and Start becomes available.
+
+The task uses a fresh WebView profile, per-process HTTP proxy and temporary local
+storage configuration. No UI business response is fabricated or overridden. Gateway
+authentication/storage and SDK admission remain fixtures; this does not accept
+production authorization, billing, PostgreSQL, Hub placement or resource budgets.
+The unrelated Bridge credential/DAW discovery path is not accepted. After evidence
+capture, the task-launched client and tunnel stop; Windows config is restored to its
+exact prior SHA256, with no remaining cargo/rustc or task scheduled jobs. Raw evidence
+and native outputs remain at `C:\builder\pymss-upstream-smoke-20261028` on Windows,
+and indexed reports at the development artifact root.
+
+PR: https://github.com/FC-TTD/pymss/pull/13.
+Verified implementation revision: `51ac023bbc0d20a5f6acd86b5c6aa186eb1aae72`.
+The full-source verification image at that revision is
+`sha256:755b77ba234586e673ccf5f12ab5f4a1ab2df3f33959bf58f9c745064b503a2b`.
+Its source/metadata versions were read back, and the provider browser
+upload/separate/play/three-download probe was rerun successfully against it.
+This image remains local to the task; it was not published or promoted.
+
+Independent evidence verdicts accept the bounded provider and installed Dayan
+paths. See `provider-smoke-review.json` (SHA256
+`6103eccf2796fd28c8b86a497e6623f301cfd15118c9159061638ead4ea47d3a`) and
+`dayan-smoke-review.json` (SHA256
+`cb1c22b4ff485b5ae0d64b6fb4b4db03c2a9fa7d32f97c3e90e5e571c09809b7`)
+at the artifact root. The active job documents exact scopes and exclusions.
