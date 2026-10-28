@@ -157,8 +157,8 @@ class UnifiedBackend:
     def run(self, task_id, recipe, inputs, output_dir, **kwargs):
         return self.batch.run(task_id, recipe, inputs, output_dir, **kwargs)
 
-    def run_profile(self, task_id, profile, inputs, output_dir):
-        return self.batch.run_profile(task_id, profile, inputs, output_dir)
+    def run_profile(self, task_id, profile, inputs, output_dir, *, options=None):
+        return self.batch.run_profile(task_id, profile, inputs, output_dir, options=options)
 
     def run_model(self, *args, **kwargs):
         return self.batch.run_model(*args, **kwargs)

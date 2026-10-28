@@ -52,6 +52,7 @@ from .core import (
     STRING,
     StringArtifact,
     VR_PARAMS,
+    _combined_channel_layout,
     audio_to_numpy,
     get_node_type,
     numpy_to_audio,
@@ -71,9 +72,12 @@ MSS_MAX_STEMS = 8
 VR_MAX_STEMS = 2
 
 CUSTOM_MODEL_TYPES = [
+    "auto",
     "mel_band_roformer",
     "bs_roformer",
     "bs_roformer_hyperace",
+    "bs_conformer",
+    "mel_band_conformer",
     "mdx23c",
     "htdemucs",
     "apollo",
@@ -90,12 +94,26 @@ OUTPUT_NODE_TYPES = {"pymss_save_audio"}
 # ---------------------------------------------------------------------------
 
 
-def _progress_for(ctx: NodeContext, node_id: object):
+def _progress_for(ctx: NodeContext, node_id: object, *, audio_index: int = 0, audio_count: int = 1,
+                  unit: str = "seconds", passes: int = 1):
     """Adapt pymss' ``callback(done, total, message)`` to per-node progress."""
 
+    pass_index = 0
+    last_done = 0
+
     def _cb(done: int, total: int, message: str | None = None) -> None:
+        nonlocal pass_index, last_done
         if ctx.progress_callback is not None:
             ctx.progress_callback(int(done), max(1, int(total)), f"node={node_id} {message or 'separate'}")
+        if ctx.progress_event_callback is None and ctx.execution_event_callback is None:
+            return
+        if passes > 1 and done == 0 and last_done > 0:
+            pass_index = min(passes - 1, pass_index + 1)
+        last_done = done
+        fraction = (pass_index + min(1.0, max(0.0, done / max(1, total)))) / passes
+        ctx.report_progress(ctx.nodes_by_id[node_id], (audio_index + fraction) / audio_count,
+                            f"node={node_id} {message or 'separate'}", audio_index=audio_index + 1,
+                            audio_count=audio_count, done=done, total=total, unit=unit)
 
     return _cb
 
@@ -113,7 +131,7 @@ def _common_separator_kwargs(
     """Build kwargs passed to ``MSSeparator`` that are not model identity."""
 
     return {
-        "device": device or ctx.device or "auto",
+        "device": ctx.device if device in (None, "", "auto") and ctx.device else device or "auto",
         "device_ids": parse_device_ids(device_ids_raw),
         "output_format": "wav",  # we never save through the separator
         "use_tta": bool(use_tta),
@@ -143,6 +161,8 @@ def _run_separation(
     *,
     build_separator: Any,
     stems: list[str],
+    audio_index: int = 0,
+    audio_count: int = 1,
 ) -> tuple[dict[str, np.ndarray], int]:
     """Drive one ``MSSeparator.separate`` call under inference_mode and progress."""
 
@@ -164,10 +184,15 @@ def _run_separation(
             model_audio = _resample(model_audio, sample_rate, target_sr)
             sample_rate = target_sr
         try:
-            separator.progress_callback = _progress_for(ctx, node.id)
+            vr = getattr(separator, "model_type", None) == "vr"
+            passes = 2 if vr and getattr(getattr(separator, "model", None), "enable_tta", False) else 1
+            separator.progress_callback = _progress_for(ctx, node.id, audio_index=audio_index,
+                                                       audio_count=audio_count, unit="batches" if vr else "seconds",
+                                                       passes=passes)
         except Exception:  # pragma: no cover - attribute is settable in practice
             pass
-        results = separator.separate(model_audio, pbar=False, stems=None)
+        layout_kwargs = {"channel_layout": audio.channel_layout} if audio.channel_layout and model_audio.shape[0] > 2 else {}
+        results = separator.separate(model_audio, pbar=False, stems=None, **layout_kwargs)
 
     return {stem: np.asarray(arr, dtype=np.float32) for stem, arr in results.items()}, sample_rate
 
@@ -187,11 +212,13 @@ def _has_config(separator: Any) -> bool:
 def _resample(audio: np.ndarray, source_sr: int, target_sr: int) -> np.ndarray:
     if source_sr == target_sr or audio.size == 0:
         return audio
-    # Use the built-in resample capability (librosa-based), not torchaudio.
-    # pymss has no torchaudio dependency.
-    from ..plugins.builtins import resample
+    # Route through the audio service so a selected provider affects every
+    # graph resample path (model prep, ensemble alignment, save conversion).
+    # Default selection is the builtin PyAV implementation — byte-identical
+    # to the previous direct plugins.builtins.resample call.
+    from ..audio_services import default_audio_service
 
-    return resample(audio, source_sr, target_sr)
+    return default_audio_service().resample(audio, source_sr, target_sr)
 
 
 def _clean_model_display_name(value: str) -> str:
@@ -220,6 +247,9 @@ def _stems_from_separator(separator: Any) -> list[str]:
     target = getattr(training, "target_instrument", None) if training is not None else None
     if target:
         return [target]
+    instruments = getattr(training, "instruments", None) if training is not None else None
+    if instruments:
+        return list(instruments)
     instruments = getattr(config, "instruments", None)
     if instruments:
         return list(instruments)
@@ -249,8 +279,8 @@ def _execute_input_audio(ctx: NodeContext, inputs: dict[str, Any]) -> NodeResult
 
     if ctx.input_path is None:
         raise DAGError("input_audio node requires an input file (pass input_path to run_dag)")
-    mix, sr = load_audio(ctx.input_path, sr=None, mono=False)
-    artifact = numpy_to_audio(np.asarray(mix, dtype=np.float32), int(sr), source_path=ctx.input_path)
+    mix, sr, layout = load_audio(ctx.input_path, sr=None, mono=False, return_layout=True)
+    artifact = AudioArtifact(mix, int(sr), source_path=ctx.input_path, channel_layout=layout)
     return NodeResult(outputs={0: artifact})
 
 
@@ -308,9 +338,9 @@ def _execute_load_audio(ctx: NodeContext, inputs: dict[str, Any]) -> NodeResult:
     if input_name:
         if input_name in ctx.inputs:
             path = ctx.inputs[input_name]
-            mix, sr = load_audio(path, sr=None, mono=False)
+            mix, sr, layout = load_audio(path, sr=None, mono=False, return_layout=True)
             name = Path(path).stem
-            artifact = numpy_to_audio(np.asarray(mix, dtype=np.float32), int(sr), source_path=path)
+            artifact = AudioArtifact(mix, int(sr), source_path=path, channel_layout=layout)
             return NodeResult(outputs={0: artifact, 1: StringArtifact(name)})
         # A named slot that the host did not provide is an explicit error —
         # falling through to positional slots would silently feed the wrong file.
@@ -319,9 +349,9 @@ def _execute_load_audio(ctx: NodeContext, inputs: dict[str, Any]) -> NodeResult:
             f"(available: {', '.join(sorted(ctx.inputs)) or 'none'})"
         )
     path = _resolve_load_audio_path(ctx, widget_name)
-    mix, sr = load_audio(path, sr=None, mono=False)
+    mix, sr, layout = load_audio(path, sr=None, mono=False, return_layout=True)
     name = Path(path).stem
-    artifact = numpy_to_audio(np.asarray(mix, dtype=np.float32), int(sr), source_path=path)
+    artifact = AudioArtifact(mix, int(sr), source_path=path, channel_layout=layout)
     return NodeResult(outputs={0: artifact, 1: StringArtifact(name)})
 
 
@@ -372,8 +402,8 @@ def _execute_load_audio_batch(ctx: NodeContext, inputs: dict[str, Any]) -> NodeR
     artifacts: list[AudioArtifact] = []
     names: list[StringArtifact] = []
     for path in paths:
-        mix, sr = load_audio(path, sr=None, mono=False)
-        artifacts.append(numpy_to_audio(np.asarray(mix, dtype=np.float32), int(sr), source_path=path))
+        mix, sr, layout = load_audio(path, sr=None, mono=False, return_layout=True)
+        artifacts.append(AudioArtifact(mix, int(sr), source_path=path, channel_layout=layout))
         names.append(StringArtifact(Path(path).stem))
     return NodeResult(outputs={0: artifacts, 1: names})
 
@@ -456,6 +486,18 @@ def _execute_save_audio(ctx: NodeContext, inputs: dict[str, Any]) -> NodeResult:
         if target_sr and target_sr != sr:
             audio = _resample(audio, sr, target_sr)
             sr = target_sr
+        # Export conversion is separate from native model channel support.
+        # An ordinary graph without this option preserves upstream mono output.
+        channels = ctx.audio_params.get("channels")
+        if channels is not None:
+            if type(channels) is not int or channels not in (1, 2):
+                raise DAGError("export channels must be 1 or 2")
+            if channels == 1:
+                audio = audio.mean(axis=0, keepdims=True)
+            elif audio.shape[0] == 1:
+                audio = np.repeat(audio, 2, axis=0)
+            elif audio.shape[0] != 2:
+                raise DAGError("stereo export requires mono or stereo model output")
         # save_audio expects samples-first [samples, channels] (librosa style).
         save_audio_array = _to_samples_first(audio) if audio.shape[0] <= audio.shape[1] else audio
         if save_audio_array.ndim == 1:
@@ -598,6 +640,8 @@ def _separate_signature_factory(max_stems: int, *, is_list: bool):
 def _resolve_stems_for_node(node: DAGNode, ctx: NodeContext, *, kind: str) -> list[str]:
     """Stem names declared on the node (from comfy output port labels)."""
 
+    if node.type.removeprefix("pymss_").endswith("_list"):
+        return []
     raw = node_data(node).get("outputs", [])
     stems: list[str] = []
     for output in raw:
@@ -686,16 +730,18 @@ def _make_model_separator_factory(ctx: NodeContext, node: DAGNode, *, kind: str,
 
 
 def _make_custom_separator_factory(ctx: NodeContext, node: DAGNode, *, model_type: str, params: dict[str, Any], use_tta: bool, device: str | None, device_ids_raw: Any, debug: bool, stems: list[str]):
-    from ..user_models import load_user_models
+    data = node_data(node)
+    if data.get("model_path"):
+        entry = {"model_path": data["model_path"], "config_path": data.get("config_path")}
+    else:
+        widgets_values = data.get("widgets_values", [])
+        model_name = str(widget(widgets_values, 0, "") or "").strip()
+        if not model_name:
+            raise DAGError("custom_mss_separate requires a model_name or model_path")
 
-    widgets_values = node_data(node).get("widgets_values", [])
-    model_name = str(widget(widgets_values, 0, "") or "").strip()
-    if not model_name:
-        raise DAGError("custom_mss_separate requires a model_name")
-
-    entry = _resolve_user_model(model_name)
-    if entry is None:
-        raise DAGError(f"custom model not found or missing yaml: {model_name}")
+        entry = _resolve_user_model(model_name)
+        if entry is None:
+            raise DAGError(f"custom model not found or missing yaml: {model_name}")
 
     def _factory():
         separator_kwargs = _common_separator_kwargs(
@@ -756,13 +802,16 @@ def _execute_separate(kind: str, *, is_list: bool):
         # custom nodes).
         stems_for_run = list(declared_stems)
         if not stems_for_run:
-            with factory() as separator:
-                stems_for_run = _stems_from_separator(separator) or ["output"]
+            separator = factory()
+            stems_for_run = _stems_from_separator(separator) or ["output"]
 
         all_audio_results: list[AudioArtifact] = []
         all_stem_names: list[StringArtifact] = []
-        for audio in audios:
-            results, output_sample_rate = _run_separation(ctx, node, audio, build_separator=factory, stems=stems_for_run)
+        for audio_index, audio in enumerate(audios):
+            ctx.report_progress(node, audio_index / len(audios), f"node={node.id} Processing audio",
+                                audio_index=audio_index + 1, audio_count=len(audios))
+            results, output_sample_rate = _run_separation(ctx, node, audio, build_separator=factory, stems=stems_for_run,
+                                                        audio_index=audio_index, audio_count=len(audios))
             claimed: set[str] = set()
             for stem in stems_for_run:
                 value = results.get(stem)
@@ -787,6 +836,8 @@ def _execute_separate(kind: str, *, is_list: bool):
                 artifact = numpy_to_audio(np.asarray(value, dtype=np.float32), output_sample_rate, stem_name=stem, source_path=audio.source_path)
                 all_audio_results.append(artifact)
                 all_stem_names.append(StringArtifact(stem))
+            ctx.report_progress(node, (audio_index + 1) / len(audios), f"node={node.id} Audio processing completed",
+                                audio_index=audio_index + 1, audio_count=len(audios))
 
         if is_list:
             outputs[0] = all_audio_results
@@ -841,7 +892,8 @@ def _execute_invert_phase(ctx: NodeContext, inputs: dict[str, Any]) -> NodeResul
     if not isinstance(audio, AudioArtifact):
         raise DAGError("pymss_audio_invert_phase requires an AUDIO input")
     inverted = ctx.require("invert_phase")(audio.audio)
-    artifact = AudioArtifact(inverted, audio.sample_rate, source_path=audio.source_path, stem_name=audio.stem_name)
+    artifact = AudioArtifact(inverted, audio.sample_rate, source_path=audio.source_path,
+                             stem_name=audio.stem_name, channel_layout=audio.channel_layout)
     return NodeResult(outputs={0: artifact})
 
 
@@ -862,7 +914,8 @@ def _execute_normalize(ctx: NodeContext, inputs: dict[str, Any]) -> NodeResult:
     peak = float(np.abs(waveform).max()) if waveform.size else 0.0
     if peak > 1.0:
         waveform = ctx.require("normalize_peak")(waveform, target_peak=0.999)
-    artifact = AudioArtifact(waveform, audio.sample_rate, source_path=audio.source_path, stem_name=audio.stem_name)
+    artifact = AudioArtifact(waveform, audio.sample_rate, source_path=audio.source_path,
+                             stem_name=audio.stem_name, channel_layout=audio.channel_layout)
     return NodeResult(outputs={0: artifact})
 
 
@@ -909,12 +962,16 @@ def _execute_ensemble(ctx: NodeContext, inputs: dict[str, Any]) -> NodeResult:
         if audio.sample_rate != sample_rate:
             arr = _resample(arr, audio.sample_rate, sample_rate)
         aligned.append(arr)
-    min_channels = min(a.shape[0] for a in aligned)
+    channel_counts = {a.shape[0] for a in aligned}
+    if max(channel_counts) > 2 and len(channel_counts) > 1:
+        raise DAGError("Ensemble requires matching multichannel audio channel counts.")
+    min_channels = min(channel_counts)
+    layout = _combined_channel_layout(audios, min_channels)
     min_samples = min(a.shape[1] for a in aligned)
     aligned = [a[:min_channels, :min_samples] for a in aligned]
     stacked = np.stack(aligned, axis=0)
     result = average_waveforms(stacked, weights=weights, algorithm=ensemble_type)
-    artifact = AudioArtifact(np.ascontiguousarray(result), sample_rate)
+    artifact = AudioArtifact(np.ascontiguousarray(result), sample_rate, channel_layout=layout)
     return NodeResult(outputs={0: artifact})
 
 

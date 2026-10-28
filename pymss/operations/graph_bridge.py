@@ -1,0 +1,118 @@
+"""Bridge: register Operations as executable graph nodes.
+
+Round 4 of docs/plugin-redesign-plan.md. ``register_operation_node`` derives
+a graph node type from an ``OperationSpec``:
+
+- node type name: ``op.<operation id>`` (stable, namespaced, collision-safe
+  against builtin node names)
+- signature: spec inputs become AUDIO-typed input slots (other port types
+  map to STRING for now), spec params become additional unconnected input
+  slots so the legacy graph UI can still attach values positionally
+- execution: named params are read from ``node.data["params"]`` when the
+  executor receives the node (via ``ctx.current_node_id``), falling back to
+  values gathered by input-slot name; validation and defaults come from the
+  spec itself — no widgets_values positional parsing in plugin code
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Mapping
+
+from ..graph.core import (
+    AUDIO,
+    STRING,
+    DAGNode,
+    NodeContext,
+    NodeResult,
+    NodeSignature,
+    PortSpec,
+    register_node,
+)
+from . import OperationSpec, _merge_and_validate_params
+
+__all__ = ["register_operation_node", "reset_operation_nodes", "operation_node_type"]
+
+_PREFIX = "op."
+
+
+def operation_node_type(operation_id: str) -> str:
+    return _PREFIX + operation_id
+
+
+def register_operation_node(
+    *,
+    spec: OperationSpec,
+    run: Callable[..., Any],
+    source: str = "operation",
+) -> str:
+    """Register one operation as a graph node type; returns the node type."""
+    node_type = operation_node_type(spec.id)
+
+    param_names = list(spec.params.get("properties", {}).keys())
+    audio_inputs = list(spec.inputs.keys())
+    output_names = list(spec.outputs.keys())
+
+    def _signature(node: DAGNode) -> NodeSignature:
+        inputs: list[PortSpec] = [
+            PortSpec(name=name, type=_port_type(spec.inputs[name])) for name in audio_inputs
+        ]
+        # Params ride as optional unconnected slots so gather-by-name works.
+        for pname in param_names:
+            inputs.append(PortSpec(name=pname, type=_param_port_type(spec, pname)))
+        types = [_port_type(spec.outputs[name]) for name in output_names]
+        return NodeSignature(inputs=inputs, output_names=output_names, output_types=types)
+
+    def _execute(ctx: NodeContext, inputs: Mapping[str, Any]) -> NodeResult:
+        op_inputs = {name: inputs[name] for name in audio_inputs if name in inputs}
+        # Params: explicit node.data["params"] wins; gathered slot values
+        # (positional widget-style) fill the rest; spec defaults apply after.
+        params: dict[str, Any] = {}
+        node = ctx.nodes_by_id.get(ctx.current_node_id) if ctx.current_node_id is not None else None
+        if node is not None and isinstance(node.data.get("params"), Mapping):
+            params.update(node.data["params"])
+        for pname in param_names:
+            if pname in inputs and pname not in params:
+                value = inputs[pname]
+                # Graph links deliver Artifacts; parameter validation needs the
+                # underlying value (e.g. StringConstant → a string param).
+                params[pname] = getattr(value, "value", value)
+        merged = _merge_and_validate_params(spec.id, spec.params, params)
+
+        from . import OperationContext
+
+        op_ctx = OperationContext(
+            progress=lambda fraction, message="": ctx.report_progress(
+                node, float(fraction), message or f"operation {spec.id}"
+            ) if node is not None else None,
+            logger=ctx.logger,
+        )
+        result = run(op_ctx, op_inputs, merged)
+        if not isinstance(result, Mapping):
+            raise ValueError(f"operation {spec.id!r} returned a non-mapping result")
+        outputs: dict[int, Any] = {}
+        for slot, name in enumerate(output_names):
+            if name in result:
+                outputs[slot] = result[name]
+        return NodeResult(outputs=outputs)
+
+    register_node(node_type, signature=_signature, execute=_execute)
+    return node_type
+
+
+def _port_type(descriptor: Mapping[str, Any]) -> str:
+    t = descriptor.get("type", "string")
+    return AUDIO if t == "audio" else STRING
+
+
+def _param_port_type(spec: OperationSpec, pname: str) -> str:
+    # Graph port tags are coarse; number/int/bool all ride as STRING slots in
+    # the legacy UI. The spec validates real types at execution time.
+    return STRING
+
+
+def reset_operation_nodes() -> None:
+    """Remove all op.* node registrations (test isolation)."""
+    from ..graph.core import _PLUGIN_REGISTRY
+
+    for node_type in [n for n in list(_PLUGIN_REGISTRY.nodes) if n.startswith(_PREFIX)]:
+        del _PLUGIN_REGISTRY.nodes[node_type]

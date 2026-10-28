@@ -180,6 +180,41 @@ def profile_output_contract(manifest):
     return roles, media
 
 
+PCM_BITS = {"PCM_16": 16, "PCM_24": 24, "PCM_32": 32, "FLOAT": 32}
+
+
+def profile_audio_params(manifest, options=None):
+    """Resolve the export contract, independently of model inference channels.
+
+    Published v1 manifests keep their fixed export contract. New versions
+    declare the supported options in their digest-bound manifest.
+    """
+    options = {} if options is None else options
+    if not isinstance(options, dict) or set(options) - {"audio_params"}:
+        raise ValueError("unsupported profile options; use audio_params")
+    params = options.get("audio_params", {})
+    if not isinstance(params, dict):
+        raise ValueError("options.audio_params must be an object")
+    schema = manifest.options.get("audio_params", {})
+    if (options and not schema) or set(params) - set(schema):
+        raise ValueError("unsupported audio_params for this profile version")
+    _, media = profile_output_contract(manifest)
+    resolved = {"channels": media["channels"], "sample_rate": media["sample_rate"],
+                "wav_bit_depth": media.get("encoding", f"PCM_{media['bits_per_sample']}")}
+    for name, value in params.items():
+        rule = schema[name]
+        if name == "channels":
+            valid = (type(value) is int and value in (1, 2)) or value == "source"
+        elif name == "sample_rate":
+            valid = type(value) is int and rule["minimum"] <= value <= rule["maximum"]
+        else:
+            valid = isinstance(value, str) and value in rule["enum"]
+        if not valid:
+            raise ValueError(f"invalid audio_params.{name}: {value!r}")
+        resolved[name] = value
+    return resolved
+
+
 class ModelCoordinator:
     """Single-resident model coordinator for native UI and provider work.
 
@@ -194,6 +229,7 @@ class ModelCoordinator:
         self._condition = threading.Condition(threading.RLock())
         self._resident_key: str | None = None
         self._resident: Any = None
+        self._pending_close: Any = None
         self._active = 0
         self._capacity = 1
         self._switching = False
@@ -232,6 +268,10 @@ class ModelCoordinator:
             while True:
                 if self._closed:
                     raise RuntimeError("model coordinator is closed")
+                if self._pending_close is not None:
+                    # A failed unload is unknown residency, including for the
+                    # same key. Finish it before admitting any further model.
+                    self._unload()
                 if self._resident_key == key and not replace and not self._switching and self._active < self._capacity:
                     self._active += 1
                     break
@@ -243,12 +283,8 @@ class ModelCoordinator:
                     break
                 if (self._resident_key != key or replace) and self._active == 0 and not self._switching:
                     self._switching = True
-                    old = self._resident
-                    self._resident = None
-                    self._resident_key = None
                     try:
-                        if old is not None:
-                            self._close(old)
+                        self._unload()
                         self._resident = (factory or self._factory)(**kwargs)
                         self._resident_key = key
                         self._capacity = max(1, int(max_concurrency))
@@ -270,16 +306,23 @@ class ModelCoordinator:
         with self.lease(max_concurrency=max_concurrency, **kwargs) as model:
             return fn(model)
 
+    def _unload(self) -> None:
+        if self._resident is not None:
+            self._pending_close, self._resident = self._resident, None
+            self._resident_key = None
+        if self._pending_close is not None:
+            self._close(self._pending_close)
+            self._pending_close = None
+
     def close(self) -> None:
         with self._condition:
             self._closed = True
             while self._active or self._switching:
                 self._condition.wait()
-            resident, self._resident = self._resident, None
-            self._resident_key = None
-            if resident is not None:
-                self._close(resident)
-            self._condition.notify_all()
+            try:
+                self._unload()
+            finally:
+                self._condition.notify_all()
 
 
 class CoordinatedSeparator:

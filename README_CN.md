@@ -10,6 +10,16 @@
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
+### 昇腾 NPU（Ascend）
+
+pymss 通过 `torch_npu` 支持华为昇腾 NPU。请先安装与 CANN 工具链及 torch 版本匹配的昇腾 PyTorch 适配器（参见 [Ascend torch_npu 兼容性矩阵](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md)），选择 PyTorch 2.7.1 或更高版本的组合，再安装 pymss：
+
+```sh
+pip install pymss
+```
+
+使用 `--device npu`（或 `device="auto"`，其优先级为 CUDA → NPU → Apple Silicon）。`--device-id` 指定 NPU 编号；传入多个编号时仅使用第一项，目前不支持多 NPU 并行。NPU 上的 STFT/ISTFT 使用基于 `torch.fft` 原语的设备内实现；针对相关 `torch_npu` 版本，RNN/LSTM/GRU 循环层使用 CPU 推理回退，结果返回 NPU。此回退不支持训练，并会增加 CPU 数据传输开销。
+
 ### AMD ROCm
 
 ```sh
@@ -93,7 +103,7 @@ pymss infer bs_roformer_voc_hyperacev2 \
   --format wav     # wav | flac | mp3 | m4a | aac | opus | vorbis | ogg
 ```
 
-`--device auto` 在有 NVIDIA GPU 时优先使用 CUDA；Apple Silicon Mac 默认使用 MLX 后端。可以用 `--device mlx` 强制 MLX，或用 `--device mps` 强制 PyTorch MPS。
+`--device auto` 在有 NVIDIA GPU 时优先使用 CUDA，其次是昇腾 NPU（`torch_npu`），再次是 Apple Silicon MLX。可以用 `--device npu` 强制昇腾 NPU、`--device mlx` 强制 MLX，或用 `--device mps` 强制 PyTorch MPS。
 `--save-as-folder` 会把每个输入音频的输出音轨保存到以该音频命名的子文件夹中，例如 `results/song/song_vocals.wav`。
 
 默认下载源是 ModelScope。也可以指定下载源或模型目录：
@@ -134,6 +144,41 @@ pymss comfy run -c workflow.json \
 ```
 
 所有 comfy-mss 节点（`pymss_load_audio`、`pymss_mss_separate`、`pymss_audio_ensemble`、`pymss_save_audio` 等）和 ComfyUI 核心音频节点（`SaveAudio`/`SaveAudioMP3`/`SaveAudioOpus`/`SaveAudioAdvanced`、`AudioMerge`、`AudioConcat`、`TrimAudioDuration`、`SplitAudioChannels`/`JoinAudioChannels`、`AudioAdjustVolume`、`EmptyAudio`、`AudioEqualizer3Band`、`PreviewAudio`、`LoadAudio`）都已支持。节点执行器消费内置能力而不是重写 DSP，因此同一套 `eq`/`mix`/`ensemble`/`{fmt}_encode` 能力同时支撑 CLI、Python API 和工作流节点。加 `--no-strict` 可以在遇到未知节点时警告并跳过，而不是报错。
+
+### 图执行事件（Python API）
+
+宿主程序可以订阅执行状态，无需向 ComfyUI 工作流添加字段，也不改变节点参数：
+
+```python
+from pymss.graph import load_comfy_file, run_dag
+
+def on_event(event):
+    print(event["event"], event["node_id"], event["node_fraction"])
+
+outputs = run_dag(
+    load_comfy_file("workflow.json"),
+    output_dir="results",
+    execution_event_callback=on_event,
+)
+```
+
+`EXECUTION_EVENT_VERSION = 1` 表示这个可选同步回调接口的版本。它独立于 ComfyUI 的 WebSocket 通信协议：ComfyUI 的 `executed` 表示节点返回了界面更新，而这里的 `node_completed` 明确表示该节点执行完成。宿主程序负责将事件接入自己的显示或通信层。JSON 解析发生在 `run_dag` 之前，解析错误仍由加载器直接抛出。已有 `progress_callback`、`progress_event_callback` 和 `PROGRESS_EVENT_VERSION` 保持原有约定。
+
+| 事件 | 含义 |
+| --- | --- |
+| `execution_started`、`execution_completed` | 图执行开始或成功结束，空 DAG 同样有完整事件。 |
+| `node_started`、`node_completed` | 节点开始执行或成功返回。 |
+| `node_progress` | 中间进度；比例为 1 可能只表示某个音频处理完成，不代表整个节点完成。 |
+| `node_failed`、`execution_failed` | 执行失败，原始异常仍向调用方抛出。 |
+| `node_cancelled`、`execution_cancelled` | 执行被 `KeyboardInterrupt` 或 `asyncio.CancelledError` 中断；中断仍向调用方抛出。 |
+| `node_skipped` | 调用方明确指定 `strict=False` 后跳过了未知节点。 |
+
+每个事件包含 `event`、`version`、`message`、`node_count` 和 `overall_fraction`。关联节点的事件还包含字符串形式的 `node_id`、`node_type`、从 0 开始的 `node_index` 和 `node_fraction`；未关联节点时这四项为 `None`。进度事件可包含从 1 开始的 `audio_index`、`audio_count`、`done`、`total`、`unit`。失败和取消事件包含 `error_type`，图级失败在能确定节点时也携带节点信息。图结构校验失败不会虚构执行节点；输入解析失败可能先于 `node_started` 产生 `node_failed`。
+
+- 取消事件记录执行期间抛出的中断，取消方式由宿主程序控制；强制结束进程无法发送最终回调。已经写出的文件会保留。
+- 回调应及时返回。`run_dag` 会抛出执行事件回调自身的异常，并清理本次执行拥有的分离器缓存；不会再次向这个出错的回调发送节点失败事件。如果回调在接收执行失败事件时又抛出异常，原始执行异常及其显式原因保持不变，回调异常保留在 `__context__` 中。
+- 事件接口不改变默认只缓存一个模型的限制；调用方传入的 `SeparatorCache` 仍由调用方负责关闭。
+- `LegacyWorkflowRunner` 同样接受 `execution_event_callback`，并为事件补充 `track`。即使指定 `continue_on_error=True`，`KeyboardInterrupt` 和 `asyncio.CancelledError` 仍会终止整个文件夹任务。
 
 ### CLI Ensemble
 
@@ -250,7 +295,7 @@ with MSSeparator.from_model_name(
 from pymss import MSSeparator, get_separation_logger
 # 初始化
 separator = MSSeparator(
-    model_type='htdemucs',
+    model_type='auto',
     model_path='path/to/model',
     config_path='path/to/config',
     device='cuda',
@@ -276,11 +321,14 @@ separator = MSSeparator(
 with separator as s:
     s.process_folder('path/to/input_file_or_folder')
 ```
+
+`model_type="auto"` 通过 pymss-core 根据 YAML 配置识别架构，支持显式架构声明，以及可识别的 BS/Mel RoFormer 与 Conformer、HTDemucs、MDX23C、SCNet、Apollo、Bandit v1/v2 配置。BS PolarFormer 沿用 `bs_roformer`；HyperACE 在加载时进一步根据权重键区分。未知或存在歧义的配置会在加载权重前抛出 `ModelTypeDetectionError`（继承 `RuntimeError`），此时需手动指定 `model_type`。没有 YAML 的 VR 和旧版模型需要显式指定类型。
+
 ### 手动构造参数
 
 每个 `MSSeparator` 参数的详细说明见 [MSSeparator 参数文档](./docs/msseparator_cn.md)。
 
-- model_type: 模型类型，例如 'htdemucs'。 必须是以下之一
+- model_type: 使用 'auto' 根据 YAML 识别架构，或手动指定类型，例如 'htdemucs'。显式类型包括
     ['bs_roformer',
     'bs_conformer',
     'mel_band_roformer',
@@ -294,7 +342,7 @@ with separator as s:
     'vr']
 - model_path: 模型文件路径。
 - config_path: 配置文件路径。
-- device: 设备类型，默认为 'auto'。 必须是以下之一 ['auto', 'cuda', 'mps', 'cpu']
+- device: 设备类型，默认为 'auto'。 必须是以下之一 ['auto', 'cuda', 'npu', 'mps', 'cpu']
 - device_ids: 设备 ID 列表，默认为 [0]。
 - output_format: 输出音频格式，默认为 'wav'。可选 wav、flac、mp3、m4a、aac、opus、vorbis、ogg。
 - use_tta: 是否使用 TTA（测试时增强），默认为 False。 使用 TTA 会使处理时间增加三倍，但质量会略有提高。
@@ -326,6 +374,8 @@ separator = MSSeparator.from_model_name(
 在 Apple Silicon 上，`pyproject.toml` 会为该后端安装 `mlx>=0.31.0`。缺少 MLX 或 backend 运行失败时，非 VR 模型会记录 `_pymss_mlx_full_backend_error` 并回退到 Torch MPS。高级用户仍然可以通过 `inference_params` 覆盖 `mps_model_backend` 和 `mps_model_compute_dtype`。
 
 ### 模型兼容性
+
+BS PolarFormer checkpoint 使用 `model_type="bs_roformer"`，匹配的 YAML 配置需保留 `model.use_pope: true`。无需单独安装 PoPE 或 Triton 包；这类模型的 MLX 后端请求会回退到 PyTorch。
 
 配置为 `model: htdemucs` 且 `htdemucs.cac: true` 的 HTDemucs checkpoint 通过 `model_type='htdemucs'` 支持。
 

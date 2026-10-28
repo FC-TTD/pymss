@@ -29,9 +29,12 @@ COPY --link pymss ./pymss
 COPY --from=native_assets /app/pymss/server/webui_static/ ./pymss/server/webui_static/
 COPY --link hub_runtime ./hub_runtime
 COPY --link hub_batch ./hub_batch
-# The runtime starts from this directory, so the fork packages are imported
-# directly; editable installation would reject the upstream legacy license field
-# with the newer setuptools bundled in the native image.
+# Publish matching distribution metadata for plugin requires_pymss checks.
+# Install into an independent path without resolving or replacing the pinned
+# Torch/CUDA/SDK dependencies inherited from the native image.
+RUN --mount=type=cache,target=/root/.cache/pip python -m pip install --no-deps --target /opt/pymss-package .
+ENV PYTHONPATH=/opt/pymss-package:/opt/ttd-hub-runtime
+RUN python -c 'import importlib.metadata as m,pathlib,tomllib,pymss; expected=tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]; assert m.version("pymss") == expected; assert pymss.__file__.startswith("/opt/pymss-fork/"); assert m.version("pymss-core") == "0.1.14"'
 ENV GRADIO_ANALYTICS_ENABLED=False TTD_WEBHOOK_URL=""
 LABEL org.opencontainers.image.source="https://github.com/FC-TTD/pymss" org.opencontainers.image.revision="${SOURCE_REV}"
 RUN python -m hub_runtime describe > /opt/pymss-fork/hub_runtime/contract.json

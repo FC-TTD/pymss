@@ -6,7 +6,7 @@ from pymss_core.modules.bandit.core.model import MultiMaskMultiSourceBandSplitRN
 class ChannelIndependentBandit(MultiMaskMultiSourceBandSplitRNNSimple):
     """Run each channel as mono, then restore the chunk/source/channel axes.
 
-    pymss-core 0.1.8 flattens channels when estimating masks but multiplies
+    pymss-core 0.1.8 through 0.1.14 flatten channels when estimating masks but multiply
     those masks against an unflattened spectrogram. Feeding explicit mono
     batches avoids broadcasting channels into the chunk batch dimension.
     Inheritance keeps checkpoint parameter names and shapes unchanged.

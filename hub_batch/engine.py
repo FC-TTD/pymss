@@ -1,5 +1,6 @@
 """Runs only inside the SDK-owned GPU process."""
 from pathlib import Path
+from copy import deepcopy
 import json
 import hashlib
 import os
@@ -13,7 +14,7 @@ from pymss.graph import SeparatorCache, load_comfy_file, run_dag
 from ttd_model_runtime.engine import engine_progress
 from ttd_model_runtime.protocol import NativeCancelled
 
-from .provider import CoordinatedSeparator, ModelCoordinator, SharedModel, profile_output_contract
+from .provider import CoordinatedSeparator, ModelCoordinator, SharedModel, PCM_BITS, profile_audio_params, profile_output_contract
 
 RECIPES = ("duality-two-stems", "instrumental-only", "dedicated-me")
 BUDGET_BYTES = 8 * 1024 ** 3
@@ -65,9 +66,10 @@ class BatchEngine:
             self.cancelled.set()
             return True
 
-    def run(self, task_id, recipe, inputs, output_dir, *, max_concurrency=None, profile=None):
+    def run(self, task_id, recipe, inputs, output_dir, *, max_concurrency=None, profile=None, options=None):
         if recipe not in RECIPES and not (profile and profile.implementation):
             raise ValueError("unsupported recipe")
+        audio_params = profile_audio_params(profile, options) if profile else None
         if not self.execution.acquire(blocking=False):
             raise RuntimeError("batch engine is busy")
         emit = engine_progress()
@@ -105,18 +107,27 @@ class BatchEngine:
 
                 item = {"index": index, "input": source, "outputs": []}
                 try:
-                    validate_duration(source)
+                    source_channels = validate_duration(source)
+                    effective = dict(audio_params) if audio_params else None
+                    if effective and effective["channels"] == "source":
+                        if source_channels not in (1, 2):
+                            raise ValueError("source channel policy supports mono or stereo input; select channels 1 or 2 to downmix")
+                        effective["channels"] = source_channels
+                    export_dag = self._configure_export(dag, effective) if effective else dag
                     result = run_dag(
-                        dag, input_path=source,
+                        export_dag, input_path=source,
                         output_dir=Path(output_dir) / f"{index:06d}",
                         model_dir=self.model_dir, download=False, device="cuda",
                         separator_cache=self.cache, name_prefix=f"{index:06d}",
                         progress_callback=progress,
+                        audio_params=effective,
                     )
                     outputs = [r.to_dict() for r in result.records]
                     if profile:
-                        outputs = self._profile_outputs(profile, outputs, Path(output_dir) / f"{index:06d}")
+                        outputs = self._profile_outputs(profile, outputs, Path(output_dir) / f"{index:06d}", effective)
                     item.update(status="succeeded", outputs=outputs)
+                    if effective:
+                        item["audio_params"] = effective
                 except NativeCancelled:
                     raise
                 except Exception as exc:
@@ -138,12 +149,30 @@ class BatchEngine:
             self._profile_concurrency = previous_concurrency
             self.execution.release()
 
-    def run_profile(self, task_id, profile, inputs, output_dir):
+    def run_profile(self, task_id, profile, inputs, output_dir, *, options=None):
         """Execute an immutable profile manifest through the DAG runner."""
         return self.run(
             task_id, profile.dag, inputs, output_dir,
-            max_concurrency=profile.max_concurrency, profile=profile,
+            max_concurrency=profile.max_concurrency, profile=profile, options=options,
         )
+
+    @staticmethod
+    def _configure_export(dag, audio_params):
+        """Apply resolved options to a run-local copy of the pinned DAG.
+
+        Model nodes and intermediate audio stay untouched. Save widgets carry
+        rate/encoding in the existing graph format; audio_params carries the
+        channel conversion to the saver. The verified on-disk DAG is immutable.
+        """
+        configured = deepcopy(dag)
+        for node in configured.nodes:
+            if node.type != "pymss_save_audio":
+                continue
+            widgets = node.data["widgets_values"]
+            rate_index = 1 if str(widgets[1]).isdigit() else 2
+            widgets[rate_index] = str(audio_params["sample_rate"])
+            widgets[rate_index + 1] = audio_params["wav_bit_depth"]
+        return configured
 
     @staticmethod
     def _sha256(path):
@@ -165,10 +194,12 @@ class BatchEngine:
                 raise ValueError("profile asset digest mismatch")
 
     @classmethod
-    def _profile_outputs(cls, profile, outputs, output_dir):
+    def _profile_outputs(cls, profile, outputs, output_dir, audio_params=None):
         import soundfile as sf
 
         roles, media = profile_output_contract(profile)
+        params = audio_params or profile_audio_params(profile)
+        encoding = params["wav_bit_depth"]
         expected = {item["native_stem"]: item for item in roles}
         stems = [item["stem"] for item in outputs]
         if len(stems) != len(expected) or set(stems) != set(expected):
@@ -182,13 +213,18 @@ class BatchEngine:
                 raise ValueError("profile output must be a distinct file inside its input output directory")
             seen.add(path)
             info = sf.info(path)
-            if (info.format != "WAV" or info.subtype != "PCM_24" or info.frames <= 0
-                    or info.samplerate != media["sample_rate"] or info.channels != media["channels"]):
-                raise ValueError("profile output media does not match WAV PCM24 48 kHz stereo")
+            if (info.format != "WAV" or info.subtype != encoding or info.frames <= 0
+                    or info.samplerate != params["sample_rate"] or info.channels != params["channels"]):
+                raise ValueError(f"profile output media does not match resolved audio_params: {params}")
+            with sf.SoundFile(path) as handle:
+                for block in handle.blocks(blocksize=65536):
+                    if not np.isfinite(block).all():
+                        raise ValueError("profile output contains non-finite audio")
             declaration = expected[item["stem"]]
             validated[item["stem"]] = {
                 **item, "role": declaration["role"], "required": declaration["required"],
-                "media_type": media["media_type"], "format": "wav", "bits_per_sample": 24,
+                "media_type": media["media_type"], "format": "wav", "encoding": encoding,
+                "bits_per_sample": PCM_BITS[encoding],
                 "sample_rate": info.samplerate, "channels": info.channels,
                 "duration_ms": round(info.frames / info.samplerate * 1000),
                 "size_bytes": path.stat().st_size, "sha256": cls._sha256(path),
@@ -370,3 +406,4 @@ def validate_duration(path):
         seconds = float(stream.duration * stream.time_base)
         if not 0 < seconds <= 900:
             raise ValueError("input audio must be between 0 and 900 seconds")
+        return stream.codec_context.channels
