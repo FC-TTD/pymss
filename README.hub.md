@@ -5,11 +5,14 @@
 
 最初接管以原edge手工preview的实际成果为基线，保留管理员改动后新增
 `hub_runtime/`和`deploy/hub/`。当前集成将源码升级到上游2.1.12/core 0.1.14，
-保留必要兼容补丁；这不代表线上已升级。验证范围见
+保留必要兼容补丁；当前线上版本和验证范围见
+[v2 交付记录](docs/spec/jobs/separation-v2-retirement/evidence.md)及
 [2.1.12升级记录](docs/hub-takeover/upgrade-2.1.12.md)。
 九套 profile 新增 `2026-10-28.v2`，复用 `options.audio_params` 配置导出声道、
 采样率和 PCM 编码；省略参数仍为 WAV/48kHz/PCM24/双声道。`channels` 支持
-`1`、`2`、`"source"`，模型原生声道与导出转换分别声明。既有固定版本继续可用。
+`1`、`2`、`"source"`，模型原生声道与导出转换分别声明。新任务只接受 v2；
+`2026-09-20.v1`、`2026-10-23.v1` 创建返回 `410 profile_retired`。
+既有固定版本只保留历史身份、查询、结果、下载与取消，不重新创建推理。
 源码接管与实际交接证据见[接管记录](docs/hub-takeover/adoption.md)。
 
 模型权重在SDK独立GPU子进程，API/UI宿主在CPU。请求完成保持热驻留；只在
