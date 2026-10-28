@@ -1,6 +1,7 @@
 """Private Provider Profile + Batch HTTP contract shared by both entries."""
 from .jobs import committed_files
 from .provider import profile_output_contract
+from .retirement import RETIRED_PROFILE_VERSIONS
 
 # The discovery envelope stays compatible with deployed Gateway consumers.
 # Export capabilities are versioned by immutable profile ID/version/digest.
@@ -39,6 +40,8 @@ def submission(payload):
 def discovery(registry):
     profiles = []
     for manifest in registry.list():
+        if manifest.version in RETIRED_PROFILE_VERSIONS:
+            continue
         roles, media = profile_output_contract(manifest)
         profiles.append({"profile_id": manifest.name, "profile_version": manifest.version,
                          "implementation_version": manifest.digest, "output_roles": roles,

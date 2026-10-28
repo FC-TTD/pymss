@@ -923,6 +923,7 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
         return jobs
 
     from hub_batch.contract import discovery, receipt as _provider_task_payload, result_task, submission
+    from hub_batch.retirement import ProfileRetired
 
     async def _batch_payload(request):
         body = await _read_body(request, state)
@@ -948,6 +949,8 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
         try:
             task = provider_jobs.submit(**payload)
             return _provider_task_payload(task)
+        except ProfileRetired as exc:
+            raise APIError(410, exc.code, str(exc)) from None
         except (ValueError, OSError) as exc:
             raise APIError(400, "invalid_request", str(exc)) from None
         except Exception as exc:
@@ -965,6 +968,8 @@ def build_app(config, runtime, *, initialize=True, jobs=None, profile_registry=N
         try:
             task = provider_jobs.submit(**payload)
             return _provider_task_payload(task)
+        except ProfileRetired as exc:
+            raise APIError(410, exc.code, str(exc)) from None
         except (ValueError, OSError) as exc:
             raise APIError(400, "invalid_request", str(exc)) from None
         except Exception as exc:

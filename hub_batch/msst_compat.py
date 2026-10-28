@@ -32,6 +32,8 @@ class CompatTasks:
         return path
 
     def submit(self, payload, mode):
+        from .retirement import validate_compat_identity
+        validate_compat_identity(payload)
         with self.guard:
             if self.closed or self.owner is not None:
                 raise RuntimeError("compatibility task is busy")
