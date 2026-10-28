@@ -1,0 +1,66 @@
+{
+  "delivery": {
+    "artifactPath": "/workspace/FC-TTD/.artifacts/pymss-v1-retirement-20261028/production-delivery.json",
+    "sha256": "c0795b75f91515521bcdca2da48e627bb3383ab333aa1677d9119fa455ab7e35"
+  },
+  "reviews": {
+    "dayan-smoke-review.json": {
+      "artifactPath": "/workspace/FC-TTD/.artifacts/pymss-v1-retirement-20261028/dayan-smoke-review.json",
+      "sha256": "b28988e7ed027a48570674d96df9c28ac03ede8a7182e2a255da3a864ee6f024"
+    },
+    "provider-final-review.json": {
+      "artifactPath": "/workspace/FC-TTD/.artifacts/pymss-v1-retirement-20261028/provider-final-review.json",
+      "sha256": "833a8488a52021a139f7f0f8eeff62283be348defbbf8b7a10d4542a0cedead5"
+    }
+  },
+  "smoke": {
+    "artifactPath": "/workspace/FC-TTD/.artifacts/pymss-v1-retirement-20261028/dayan-smoke.json",
+    "sha256": "83b143a779c4387c5805cfb72efd4c10df1e34889d26793edf623ea7154b14ac"
+  },
+  "sources": [
+    {
+      "worktree": "/workspace/FC-TTD/.worktrees/gateway-separation-v2",
+      "commit": "106c0d7305d72b35ae1463bd16e5131665c90e57",
+      "tag": "separation-v2-20261028-106c0d7305d7"
+    },
+    {
+      "worktree": "/workspace/FC-TTD/.worktrees/dayan-separation-v2",
+      "commit": "9f96d3ae8322d748681ecfc78119761929787898",
+      "tag": "separation-v2-20261028-9f96d3ae8322"
+    },
+    {
+      "worktree": "/workspace/FC-TTD/.worktrees/pymss-retire-v1",
+      "commit": "fa145fb104e54917c1462fb314e2b192bd6451db",
+      "tag": "separation-v2-20261028-fa145fb104e5"
+    },
+    {
+      "worktree": "/workspace/FC-TTD/.worktrees/hub-profile-v2-admission",
+      "commit": "7d9ec1ab307fe5abcae5c08416fd3c956018152b",
+      "tag": "separation-v2-20261028-7d9ec1ab307f"
+    }
+  ],
+  "images": {
+    "provider_image": "registry.ttd/pymss/hub@sha256:e39047593811fbf511d8f065f2fd0e71e16ce4301731139ad7711e4ae85fb5db",
+    "gateway_api_image": "registry.ttd/ttd-model-gateway/gateway@sha256:5db0e5f544468da584342ffd1d1e867766b410f92a51e86dd88139879f54743d",
+    "gateway_worker_image": "registry.ttd/ttd-model-gateway/gateway:h-641c60f305f6@sha256:30ee5c83430a9a4e8253cb3bfe280a2b5ea07ba0a119a69bf78ee9e54aba2f32"
+  },
+  "runtime": {
+    "channel": "beta",
+    "runtimeVersion": "2.0.0-beta.17",
+    "publishedAt": "2026-10-28T08:25:24Z",
+    "files": {
+      "runtime.html": {
+        "url": "https://dayan.api.ttd.honeywave.net/standalone/versions/2.0.0-beta.17/runtime.html",
+        "sha256": "055b7ece3ba4d4747b4a9b301d135e1e61b28f3ee43d1f97a6b44bb33dd7a535"
+      }
+    }
+  },
+  "limits": [
+    "Nine-profile full GPU/output matrix was previously exercised in isolation; this production release uses FX5s default/nondefault and native v1 history only.",
+    "No connected DAW/timeline integration, long audio, cancellation/disconnect or all codecs repeated in production.",
+    "Historical native test uses seeded local metadata referencing real old production task, with requiredRoles populated. Missing-requiredRoles historical fallback is covered by contract tests, not this native case.",
+    "Source-channel preservation for actual mono native input is covered by Gateway unit/PG tests; native prepare normalization remains unchanged.",
+    "Post-release denoise initial create/upload/start client trace was not retained after harness timeout; retained post-release browser evidence covers reconciled result read/playback/export, while fresh raw expert separation has full HTTP trace."
+  ],
+  "shared_impact": "Managed rollout temporarily fenced pymss and three sibling model entrances. Conservative interval is about50seconds around barrier/install/acceptance/reopen; all four entries now acknowledged open and active/pending/unknown/http_active0. Existing idle lease reclamation can cause next model call to reload. Not zero shared impact. FireRed remains without a lease and reports resource_busy; an open entrance does not prove immediate GPU capacity."
+}
