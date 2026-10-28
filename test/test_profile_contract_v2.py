@@ -15,13 +15,13 @@ def test_profile_contract_discovery_and_unknown_options_before_acceptance(tmp_pa
         assert response.status_code == 200
         payload = response.json()
         assert payload["contract_version"] == "2026-10-23.v1"
-        assert len(payload["profiles"]) == 22
+        assert len(payload["profiles"]) == 9
         profile = next(item for item in payload["profiles"] if item["profile_id"] == "dialogue-vocal-b" and item["profile_version"] == "2026-10-28.v2")
         assert profile["implementation_version"] == default_profiles().resolve("dialogue-vocal-b").digest
         assert [item["role"] for item in profile["output_roles"]] == ["vocals", "instrumental"]
         source = tmp_path / "input.wav"
         source.write_bytes(b"not read")
-        body = {"profile_id": "dialogue-vocal-b", "profile_version": "2026-10-23.v1", "inputs": [str(source)]}
+        body = {"profile_id": "dialogue-vocal-b", "profile_version": "2026-10-28.v2", "inputs": [str(source)]}
         assert client.post("/v1/separations", json={**body, "options": {"batch_size": 2}}).status_code == 400
         assert client.post("/v1/separations", json={**body, "implementation_version": "wrong"}).status_code == 400
         assert client.post("/v1/separations", json={**body, "params": {"batch_size": 2}}).status_code == 400
@@ -163,7 +163,7 @@ def test_combined_runtime_uses_same_profile_discovery_and_validation(tmp_path):
     config = ServerConfig(model_dir=str(tmp_path), webui=False)
     with TestClient(build_app(config, Runtime(None), jobs=jobs, initialize=False)) as client:
         assert client.get("/v1/separations/profiles").json() == discovery(default_profiles())
-        payload = {"profile_id": "dialogue-vocal-b", "profile_version": "2026-10-23.v1", "inputs": ["never-read.wav"]}
+        payload = {"profile_id": "dialogue-vocal-b", "profile_version": "2026-10-28.v2", "inputs": ["never-read.wav"]}
         assert client.post("/v1/separations", json={**payload, "options": {"batch_size": 2}}).status_code == 400
         assert client.post("/v1/batches", json={**payload, "params": {"batch_size": 2}}).status_code == 400
         assert jobs.store.pending() == 0

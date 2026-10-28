@@ -64,7 +64,7 @@ def test_complete_profile_runs_packaged_dag_and_exports_semantic_wav(tmp_path, p
 
     source = tmp_path / "source.wav"
     sf.write(source, np.zeros((4410, 2), dtype=np.float32), 44100)
-    actual = default_profiles().resolve(profile, "2026-10-23.v1")
+    actual = default_profiles().resolve(profile, "2026-10-28.v2")
     # Exercise streamed identity validation using a tiny pinned fixture. The
     # packaged DAG and model/native role declarations are the real manifests.
     asset = tmp_path / "fixture.ckpt"
@@ -136,10 +136,16 @@ def test_legacy_profile_retains_digest_and_adds_explicit_output_identity(tmp_pat
     jobs = Jobs(Runtime(engine), tmp_path / "state", tmp_path, tmp_path / "out", default_profiles())
     try:
         with TestClient(build_app(jobs)) as client:
+            # Historical execution and manifests remain readable. Seed the
+            # already-completed identity rather than creating a retired task.
+            engine.prepare("historical")
+            files = engine.run_profile("historical", manifest, [str(source)], str(tmp_path / "out" / "historical"))
+            jobs.store.put({"id":"historical", "status":"succeeded", "profile":manifest.to_dict(),
+                            "input_paths":[str(source)], "output_dir":str(tmp_path / "out" / "historical"), "files":files})
             response = client.post("/v1/separations", json={"profile_id": name,
                 "profile_version": manifest.version, "inputs": [str(source)]})
-            assert response.status_code == 202
-            task = wait_task(client, response.json()["id"])
+            assert response.status_code == 410
+            task = client.get("/v1/batches/historical/result").json()
             assert task["status"] == "succeeded", task
             assert task["implementation_version"] == before == default_profiles().resolve(name, manifest.version).digest
             roles, _ = profile_output_contract(manifest)

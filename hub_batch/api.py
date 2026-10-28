@@ -11,6 +11,7 @@ from ttd_model_runtime.protocol import HubError
 from .jobs import Busy, TERMINAL
 from .provider import ProfileRegistry
 from .contract import discovery, receipt, result_task, submission
+from .retirement import ProfileRetired, validate_compat_identity
 
 
 class BatchRequest(BaseModel):
@@ -55,18 +56,7 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
 
         def resolve_provider_payload(payload):
             """Normalize the stable separation shape to the provider task shape."""
-            if payload.get("profile"):
-                if profile_registry is None:
-                    raise ValueError("profile registry is not configured")
-                profile = profile_registry.resolve(str(payload["profile"]), payload.get("profile_version"))
-                if not profile.models:
-                    raise ValueError("profile has no model implementation")
-                payload = dict(payload)
-                payload.setdefault("model_name", profile.models[0])
-                payload.setdefault("stems", list(profile.outputs))
-                # Profile options describe export capabilities, not expert
-                # model inference overrides on this legacy compatibility route.
-                payload.setdefault("params", {})
+            validate_compat_identity(payload)
             if "inputs" in payload and "input_paths" not in payload:
                 payload = dict(payload)
                 payload["input_paths"] = payload.pop("inputs")
@@ -74,9 +64,9 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
 
         async def submit_compat(request: Request):
             payload = await request.json()
-            payload = resolve_provider_payload(payload)
             mode = request.query_params.get("mode", "async")
             try:
+                payload = resolve_provider_payload(payload)
                 result = await asyncio.to_thread(compat.submit, payload, mode)
                 result = compat_payload(result)
                 if mode == "sse":
@@ -96,6 +86,8 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
                             await asyncio.sleep(.25)
                     return StreamingResponse(one_event(), media_type="text/event-stream")
                 return result
+            except ProfileRetired as exc:
+                raise HTTPException(410, {"code": exc.code, "message": str(exc)}) from None
             except (ValueError, KeyError, OSError) as exc:
                 raise HTTPException(400, str(exc)) from None
             except RuntimeError as exc:
@@ -154,6 +146,8 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
                     Path(path).resolve(strict=True)
                 raise HTTPException(503, "provider jobs unavailable")
             return receipt(jobs.submit(**normalized))
+        except ProfileRetired as exc:
+            raise HTTPException(410, {"code": exc.code, "message": str(exc)}) from None
         except Busy as exc:
             raise HTTPException(429, str(exc)) from None
         except (ValueError, OSError) as exc:
@@ -166,6 +160,8 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
                 raise HTTPException(503, "provider jobs unavailable")
             task = jobs.submit(**submission(body.model_dump(exclude_none=True)))
             return receipt(task) if task.get("profile") else task
+        except ProfileRetired as exc:
+            raise HTTPException(410, {"code": exc.code, "message": str(exc)}) from None
         except Busy as exc:
             raise HTTPException(429, str(exc)) from None
         except (ValueError, OSError) as exc:

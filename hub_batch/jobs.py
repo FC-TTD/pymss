@@ -115,6 +115,8 @@ class Jobs:
 
     def submit(self, recipe=None, paths=None, output_dir=None, *, profile=None, profile_version=None,
                options=None, implementation_version=None):
+        from .retirement import require_active_version
+        require_active_version(profile_version)
         if options is not None and not isinstance(options, dict):
             raise ValueError("options must be an object")
         # Copy before persisting or handing execution to another thread.
@@ -129,6 +131,7 @@ class Jobs:
                 manifest = self.profile_registry.resolve(str(profile), profile_version)
             except KeyError as exc:
                 raise ValueError(f"profile not found: {exc.args[0]}") from None
+            require_active_version(manifest.version)
             recipe = manifest.dag
             if implementation_version is not None and implementation_version != manifest.digest:
                 raise ValueError("profile implementation version mismatch")
