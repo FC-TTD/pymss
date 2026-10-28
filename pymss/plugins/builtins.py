@@ -88,10 +88,10 @@ def invert_phase(audio, sample_rate=None) -> np.ndarray:
     return -np.asarray(audio, dtype=np.float32)
 
 
-def normalize_peak(audio, sample_rate=None, target_peak: float = 0.99) -> np.ndarray:
-    """Scale audio so its peak amplitude equals target_peak. No-op on silence."""
+def normalize_peak(audio, sample_rate=None, target_peak: float = 0.99, *, reference_peak: float | None = None) -> np.ndarray:
+    """Scale audio to target_peak, optionally using a peak shared by multiple stems."""
     audio = np.asarray(audio, dtype=np.float32)
-    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    peak = float(reference_peak) if reference_peak is not None else (float(np.max(np.abs(audio))) if audio.size else 0.0)
     if peak <= 0.0 or not np.isfinite(peak):
         return audio
     return audio * (target_peak / peak)
@@ -276,23 +276,14 @@ def eq(
 
 
 def resample(audio, orig_sr: float, target_sr: float) -> np.ndarray:
-    """Resample audio between sample rates using librosa (already a dependency).
+    """Resample audio using the file loader's PyAV/FFmpeg implementation.
 
     Audio is channel-first (channels, samples) or 1-D mono. Returns the same
     layout at the target sample rate.
     """
-    import librosa
+    from ..audio_io import resample_audio
 
-    audio = np.asarray(audio, dtype=np.float32)
-    if int(orig_sr) == int(target_sr):
-        return audio
-    if audio.ndim == 1:
-        return librosa.resample(audio, orig_sr=int(orig_sr), target_sr=int(target_sr))
-    # channel-first: resample each channel, pad to equal length
-    channels = [librosa.resample(audio[i], orig_sr=int(orig_sr), target_sr=int(target_sr)) for i in range(audio.shape[0])]
-    maxlen = max(ch.shape[-1] for ch in channels)
-    padded = np.stack([np.pad(ch, (0, maxlen - ch.shape[-1])) for ch in channels], axis=0)
-    return padded
+    return resample_audio(audio, orig_sr, target_sr)
 
 
 # ---------------------------------------------------------------------------

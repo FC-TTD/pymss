@@ -64,7 +64,9 @@ def build_app(jobs, api_key=None, compat=None, profile_registry: ProfileRegistry
                 payload = dict(payload)
                 payload.setdefault("model_name", profile.models[0])
                 payload.setdefault("stems", list(profile.outputs))
-                payload.setdefault("params", dict(profile.options))
+                # Profile options describe export capabilities, not expert
+                # model inference overrides on this legacy compatibility route.
+                payload.setdefault("params", {})
             if "inputs" in payload and "input_paths" not in payload:
                 payload = dict(payload)
                 payload["input_paths"] = payload.pop("inputs")

@@ -15,8 +15,8 @@ def test_profile_contract_discovery_and_unknown_options_before_acceptance(tmp_pa
         assert response.status_code == 200
         payload = response.json()
         assert payload["contract_version"] == "2026-10-23.v1"
-        assert len(payload["profiles"]) == 13
-        profile = next(item for item in payload["profiles"] if item["profile_id"] == "dialogue-vocal-b")
+        assert len(payload["profiles"]) == 22
+        profile = next(item for item in payload["profiles"] if item["profile_id"] == "dialogue-vocal-b" and item["profile_version"] == "2026-10-28.v2")
         assert profile["implementation_version"] == default_profiles().resolve("dialogue-vocal-b").digest
         assert [item["role"] for item in profile["output_roles"]] == ["vocals", "instrumental"]
         source = tmp_path / "input.wav"

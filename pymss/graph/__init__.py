@@ -18,6 +18,7 @@ from .core import (
     AudioArtifact,
     DAG,
     DAGError,
+    EXECUTION_EVENT_VERSION,
     DAGLink,
     DAGNode,
     DAGOutputRecord,
@@ -30,6 +31,7 @@ from .core import (
     OUTPUT_NODE_TYPES,
     ParamsArtifact,
     PortSpec,
+    PROGRESS_EVENT_VERSION,
     SeparatorCache,
     STRING,
     StringArtifact,
@@ -54,6 +56,8 @@ from .yaml_compiler import compile_workflow_to_dag
 from .runner import LegacyWorkflowRunner
 
 __all__ = [
+    "PROGRESS_EVENT_VERSION",
+    "EXECUTION_EVENT_VERSION",
     # artifacts
     "AudioArtifact",
     "StringArtifact",

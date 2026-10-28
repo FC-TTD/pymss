@@ -28,6 +28,22 @@ pip install pymss
 
 WSL2 (RDNA3/RDNA4) can follow the Linux steps instead.
 
+### Ascend NPU
+
+pymss runs on Huawei Ascend NPUs through `torch_npu`. Install the Ascend PyTorch adapter matching
+your CANN toolkit and torch build (see the [Ascend torch_npu compatibility matrix](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md)).
+Choose a combination with PyTorch 2.7.1 or later, then install pymss:
+
+```sh
+pip install pymss
+```
+
+Use `--device npu` (or `device="auto"`, which prefers CUDA, then NPU, then Apple Silicon).
+`--device-id` selects the NPU index; if multiple IDs are supplied, only the first is used.
+Multi-NPU parallel execution is not supported. On NPU, STFT/ISTFT uses `torch.fft` primitives.
+RNN/LSTM/GRU layers use a CPU inference fallback for affected `torch_npu` builds, with results
+returned to the NPU. This fallback does not support training and adds CPU transfer overhead.
+
 For CLI and Python API usage, install:
 
 ```sh
@@ -95,7 +111,7 @@ pymss infer bs_roformer_voc_hyperacev2 \
   --format wav     # wav | flac | mp3 | m4a | aac | opus | vorbis | ogg
 ```
 
-`--device auto` uses CUDA first when an NVIDIA GPU is available. On Apple Silicon it uses the MLX backend by default. Use `--device mlx` to force MLX, or `--device mps` to force PyTorch MPS.
+`--device auto` uses CUDA first when an NVIDIA GPU is available, then Ascend NPU (`torch_npu`), then Apple Silicon MLX. Use `--device npu` to force Ascend NPU, `--device mlx` to force MLX, or `--device mps` to force PyTorch MPS.
 `--save-as-folder` writes each input audio file's stems under a subfolder named after that audio file, for example `results/song/song_vocals.wav`.
 
 The default download source is ModelScope. You can choose another source or model directory:
@@ -136,6 +152,41 @@ pymss comfy run -c workflow.json \
 ```
 
 All comfy-mss nodes (`pymss_load_audio`, `pymss_mss_separate`, `pymss_audio_ensemble`, `pymss_save_audio`, ...) and ComfyUI core audio nodes (`SaveAudio`/`SaveAudioMP3`/`SaveAudioOpus`/`SaveAudioAdvanced`, `AudioMerge`, `AudioConcat`, `TrimAudioDuration`, `SplitAudioChannels`/`JoinAudioChannels`, `AudioAdjustVolume`, `EmptyAudio`, `AudioEqualizer3Band`, `PreviewAudio`, `LoadAudio`) are supported. Node executors consume built-in capabilities rather than reimplementing DSP, so the same `eq` / `mix` / `ensemble` / `{fmt}_encode` capabilities back the CLI, the Python API, and the workflow nodes. Pass `--no-strict` to skip unknown node types with a warning instead of failing.
+
+### Graph execution events (Python API)
+
+Graph hosts can observe execution without adding fields to ComfyUI workflows or changing node widgets:
+
+```python
+from pymss.graph import load_comfy_file, run_dag
+
+def on_event(event):
+    print(event["event"], event["node_id"], event["node_fraction"])
+
+outputs = run_dag(
+    load_comfy_file("workflow.json"),
+    output_dir="results",
+    execution_event_callback=on_event,
+)
+```
+
+`EXECUTION_EVENT_VERSION = 1` describes this optional, synchronous callback API. It is independent of ComfyUI's WebSocket transport; in particular, ComfyUI's `executed` message represents a UI update, while `node_completed` here always means the executor completed that node. Hosts translate events to their own display or transport. JSON parsing errors occur before `run_dag` and are raised by the loader. Existing `progress_callback`, `progress_event_callback`, and `PROGRESS_EVENT_VERSION` retain their contracts.
+
+| Events | Meaning |
+| --- | --- |
+| `execution_started`, `execution_completed` | Graph execution begins or finishes successfully, including empty DAGs. |
+| `node_started`, `node_completed` | A node begins execution or returns successfully. |
+| `node_progress` | Intermediate progress. A fraction of 1 can finish one audio item without completing the node. |
+| `node_failed`, `execution_failed` | Execution failed; the original exception still propagates. |
+| `node_cancelled`, `execution_cancelled` | Execution was interrupted by `KeyboardInterrupt` or `asyncio.CancelledError`; the interruption still propagates. |
+| `node_skipped` | An unknown node was skipped under an explicitly requested `strict=False`. |
+
+Every event contains `event`, `version`, `message`, `node_count`, and `overall_fraction`. Node-associated events also contain `node_id` (string), `node_type`, zero-based `node_index`, and `node_fraction`; these four fields are `None` when no node is involved. Progress events may include `audio_index` (one-based), `audio_count`, `done`, `total`, and `unit`. Failure/cancellation events contain `error_type`; an execution-level failure also identifies its node when available. Graph validation errors have no fabricated active node. Input-resolution errors can report `node_failed` before `node_started`.
+
+- Cancellation events report interruptions raised during execution. Cancellation remains controlled by the host; killing the process cannot deliver a final callback. Already written files are retained.
+- Callbacks must return promptly. `run_dag` propagates execution-observer errors and releases its owned separator cache; they are not reported back to the failing observer as node failures. If an observer raises while receiving an execution failure, the original execution exception and its explicit cause are preserved; the observer exception remains in `__context__`.
+- Event delivery does not change the default single-model cache limit. The caller remains responsible for closing a supplied `SeparatorCache`.
+- `LegacyWorkflowRunner` accepts `execution_event_callback` and adds `track` to events. `KeyboardInterrupt` and `asyncio.CancelledError` stop the whole folder run even with `continue_on_error=True`.
 
 ### CLI ensemble
 
@@ -277,7 +328,7 @@ from pymss import MSSeparator, get_separation_logger
 
 # init
 separator = MSSeparator(
-    model_type='htdemucs', 
+    model_type='auto',
     model_path='path/to/model',
     config_path='path/to/config',
     device='cuda',
@@ -304,11 +355,13 @@ with separator as s:
     s.process_folder('path/to/input_file_or_folder')
 ```
 
+`model_type="auto"` detects the architecture from the YAML configuration using pymss-core. It supports explicit architecture declarations and recognized configurations for BS/Mel RoFormer and Conformer, HTDemucs, MDX23C, SCNet, Apollo, and Bandit v1/v2. BS PolarFormer uses `bs_roformer`; HyperACE is refined from checkpoint keys during loading. Unknown or ambiguous configurations raise `ModelTypeDetectionError` (a `RuntimeError` subclass) before weights are loaded; specify `model_type` manually in that case. VR and legacy models without YAML require an explicit type.
+
 ### Manual Constructor Parameters
 
 For a detailed explanation of every `MSSeparator` argument, see the [MSSeparator parameter guide](./docs/msseparator.md).
 
-- model_type: The type of model, e.g., 'htdemucs'. Must be one of 
+- model_type: Use 'auto' for YAML-based detection, or specify an architecture, e.g., 'htdemucs'. Explicit types include
     ['bs_roformer', 
     'bs_conformer',
     'mel_band_roformer', 
@@ -322,7 +375,7 @@ For a detailed explanation of every `MSSeparator` argument, see the [MSSeparator
     'vr']
 - model_path: The path to the model file.
 - config_path: The path to the configuration file.
-- device: The type of device, default is 'auto'. Must be one of ['auto', 'cuda', 'mps', 'cpu']
+- device: The type of device, default is 'auto'. Must be one of ['auto', 'cuda', 'npu', 'mps', 'cpu']
 - device_ids: List of device IDs, default is [0].
 - output_format: The output audio format, default is 'wav'. One of wav, flac, mp3, m4a, aac, opus, vorbis, ogg.
 - use_tta: Whether to use TTA, default is False. Using TTA will triple the processing time with a little bit improvement in quality.
@@ -354,6 +407,8 @@ separator = MSSeparator.from_model_name(
 On Apple Silicon, `pyproject.toml` installs `mlx>=0.31.0` for this backend. If MLX is missing or a non-VR backend fails, the model records `_pymss_mlx_full_backend_error` and falls back to Torch MPS. Advanced users can still override `mps_model_backend` and `mps_model_compute_dtype` through `inference_params`.
 
 ### Model Compatibility
+
+BS PolarFormer checkpoints use `model_type="bs_roformer"` with `model.use_pope: true` in the matching YAML configuration. No separate PoPE or Triton package is required; MLX backend requests for these models fall back to PyTorch.
 
 HTDemucs checkpoints whose config uses `model: htdemucs` and `htdemucs.cac: true` are supported through `model_type='htdemucs'`.
 

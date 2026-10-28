@@ -340,13 +340,10 @@ def _ensure_model_files(args):
 
 
 def cmd_infer(args):
-    """Implement the cmd infer helper.
+    """Run separation inference over an input file or folder."""
+    from .plugins import ensure_plugins_loaded
 
-    Args:
-        args (argparse.Namespace): Parsed command-line arguments.
-
-    Returns:
-        Any: Computed result."""
+    ensure_plugins_loaded()
     _ensure_model_files(args)
     logger = get_separation_logger()
     inference_progress = _CliInferenceProgress()
@@ -377,6 +374,62 @@ def cmd_infer(args):
             inference_progress.close()
     logger.info(f"Processed {len(files)} file(s).")
     return 0
+
+
+def cmd_ops(args):
+    """Handle ``pymss ops list|describe|run`` over the Operation runtime."""
+    from .operations import OperationContext, OperationError, default_runtime
+    from .plugins import ensure_plugins_loaded
+
+    # The global loader imports plugin modules; their setup() registers
+    # operations into the process default runtime. Using it here (instead of
+    # an isolated runtime) means each plugin loads exactly once per process.
+    ensure_plugins_loaded()
+    runtime = default_runtime()
+    cmd = getattr(args, "ops_command", None) or "list"
+
+    if cmd == "list":
+        ops = runtime.list_operations()
+        if not ops:
+            print("No operations registered (builtins arrive in round 7; plugins with setup() count).")
+            return 0
+        print(f"{len(ops)} operation(s):")
+        for op in ops:
+            print(f"  {op['id']}  v{op['schemaVersion']}  {op['title']}")
+        return 0
+
+    if cmd == "describe":
+        try:
+            spec = runtime.describe_operation(args.operation)
+        except OperationError as exc:
+            print(f"pymss ops describe: error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(spec, indent=2, ensure_ascii=False))
+        return 0
+
+    if cmd == "run":
+        params = _parse_key_value(args.param)
+        inputs = {}
+        for entry in args.input or []:
+            if "=" not in entry:
+                raise argparse.ArgumentTypeError(f"Expected name=path, got {entry!r}")
+            name, path = entry.split("=", 1)
+            inputs[name] = {"kind": "file", "path": path}
+        try:
+            result = runtime.run(
+                args.operation,
+                inputs=inputs,
+                params=params,
+                context=OperationContext(),
+            )
+        except OperationError as exc:
+            print(f"pymss ops run: error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+
+    print(f"pymss ops: unknown subcommand {cmd!r}", file=sys.stderr)
+    return 1
 
 
 def cmd_ensemble(args):
@@ -431,6 +484,9 @@ def cmd_workflow_validate(args):
 
 def cmd_workflow_run(args):
     """Run an audio workflow from a YAML/JSON file via the unified DAG core."""
+    from .plugins import ensure_plugins_loaded
+
+    ensure_plugins_loaded()
     from .graph import LegacyWorkflowRunner
 
     logger = get_separation_logger()
@@ -473,6 +529,9 @@ def _parse_named_inputs(values):
 
 def cmd_comfy_run(args):
     """Run a native comfy-mss JSON workflow via the DAG core."""
+    from .plugins import ensure_plugins_loaded
+
+    ensure_plugins_loaded()
     from .graph import load_comfy_file, run_dag
 
     logger = get_separation_logger()
@@ -505,13 +564,14 @@ def cmd_comfy_run(args):
 
 
 def cmd_serve(args):
-    """Implement the cmd serve helper.
+    """Start the OpenAI-style HTTP inference server."""
+    from .plugins import ensure_plugins_loaded
 
-    Args:
-        args (argparse.Namespace): Parsed command-line arguments.
+    # Load once at startup: plugins may provide codecs/capabilities used by
+    # later requests; per-request loading would be redundant (idempotent) but
+    # surfacing load failures at boot is the useful behavior.
+    ensure_plugins_loaded()
 
-    Returns:
-        Any: Computed result."""
     from .server import ServerConfig, run_server
 
     config = ServerConfig(
@@ -731,7 +791,7 @@ def build_parser():
         action="store_true",
         help="Save each input audio file's separated stems in a subfolder named after the audio file.",
     )
-    infer_parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "rocm", "mps", "mlx"])
+    infer_parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "rocm", "mps", "npu", "mlx"])
     infer_parser.add_argument(
         "--device-id", action="append", type=int, dest="device_ids", help="CUDA device id. Can be repeated."
     )
@@ -851,7 +911,7 @@ def build_parser():
     )
     workflow_run_parser.add_argument("--source", default="modelscope", choices=["modelscope", "huggingface", "hf-mirror"])
     workflow_run_parser.add_argument("--endpoint", help="Custom resolve endpoint. It must serve files by relative path.")
-    workflow_run_parser.add_argument("--device", choices=["auto", "cpu", "cuda", "rocm", "mps", "mlx"])
+    workflow_run_parser.add_argument("--device", choices=["auto", "cpu", "cuda", "rocm", "mps", "npu", "mlx"])
     workflow_run_parser.add_argument("--format", choices=["wav", "flac", "mp3", "m4a"], dest="output_format")
     workflow_run_parser.add_argument("--wav-bit-depth", default="FLOAT", choices=["FLOAT", "PCM_16", "PCM_24"])
     workflow_run_parser.add_argument("--flac-bit-depth", default="PCM_16", choices=["PCM_16", "PCM_24"])
@@ -894,7 +954,7 @@ def build_parser():
     comfy_run_parser.add_argument("--download", action="store_true", help="Download missing model files before running.")
     comfy_run_parser.add_argument("--source", default="modelscope", choices=["modelscope", "huggingface", "hf-mirror"])
     comfy_run_parser.add_argument("--endpoint", help="Custom resolve endpoint. It must serve files by relative path.")
-    comfy_run_parser.add_argument("--device", choices=["auto", "cpu", "cuda", "rocm", "mps", "mlx"])
+    comfy_run_parser.add_argument("--device", choices=["auto", "cpu", "cuda", "rocm", "mps", "npu", "mlx"])
     comfy_run_parser.add_argument("--format", choices=["wav", "flac", "mp3", "m4a", "aac", "opus", "vorbis", "ogg"], dest="output_format")
     comfy_run_parser.add_argument("--strict", dest="strict", action="store_true", default=True, help="Fail on unknown node types (default).")
     comfy_run_parser.add_argument("--no-strict", dest="strict", action="store_false", help="Skip unknown node types with a warning.")
@@ -922,7 +982,7 @@ def build_parser():
     )
     serve_parser.add_argument("--source", default="modelscope", choices=["modelscope", "huggingface", "hf-mirror"])
     serve_parser.add_argument("--endpoint", help="Custom resolve endpoint. It must serve files by relative path.")
-    serve_parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "rocm", "mps", "mlx"])
+    serve_parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "rocm", "mps", "npu", "mlx"])
     serve_parser.add_argument(
         "--device-id",
         action="append",
@@ -947,18 +1007,52 @@ def build_parser():
     serve_parser.add_argument("--webui", action="store_true", help="Serve the optional browser WebUI at /ui/.")
     serve_parser.set_defaults(func=cmd_serve)
 
+    # ==========================
+    # Operations (round 2)
+    # ==========================
+    ops_parser = subparsers.add_parser(
+        "ops",
+        help="List, describe, and run registered operations.",
+        formatter_class=lambda prog: argparse.RawTextHelpFormatter(prog, max_help_position=60),
+    )
+    ops_subparsers = ops_parser.add_subparsers(dest="ops_command", required=False)
+    ops_subparsers.add_parser("list", help="List registered operations (default).")
+    describe_parser = ops_subparsers.add_parser("describe", help="Print one operation's spec as JSON.")
+    describe_parser.add_argument("operation", help="Operation id, e.g. pymss.loudnorm.normalize.")
+    run_parser = ops_subparsers.add_parser("run", help="Run an operation.")
+    run_parser.add_argument("operation", help="Operation id.")
+    run_parser.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        help="Named file input as name=path. Repeatable.",
+    )
+    run_parser.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        help="Parameter as key=value (bool/int/float parsed automatically).",
+    )
+    ops_parser.set_defaults(func=cmd_ops, ops_command="list")
+
     return parser
 
 
 def main(argv=None):
     """Run the pymss command-line interface.
 
-    Args:
-        argv (Sequence[str] | None, optional): Command-line arguments. Uses sys.argv when None. Defaults to None.
+    Loads user plugins first so their registered CLI subcommands exist before
+    argument parsing, then mounts any plugin-registered commands that do not
+    collide with builtin subparsers.
+    """
+    from .plugins import ensure_plugins_loaded, get_registry
 
-    Returns:
-        int: Process exit code."""
     parser = build_parser()
+    try:
+        ensure_plugins_loaded()
+    except Exception as exc:  # noqa: BLE001 - plugin load errors must not kill the CLI
+        print(f"pymss: warning: plugin loading failed: {exc}", file=sys.stderr)
+    _mount_plugin_cli_commands(parser)
     args = parser.parse_args(argv)
     try:
         return args.func(args)
@@ -967,6 +1061,60 @@ def main(argv=None):
         print(f"pymss error: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 1
+
+
+def _mount_plugin_cli_commands(parser) -> None:
+    """Attach registry.cli_commands as argparse subparsers.
+
+    A plugin command whose leading namespace collides with a builtin
+    subcommand is skipped with a warning instead of shadowing it. Plugin
+    commands are grouped under their source plugin in the help text.
+    """
+    from .plugins import get_registry
+
+    registry = get_registry()
+    if not registry.cli_commands:
+        return
+    # argparse exposes existing subparsers through _subparsers_action; the
+    # choices dict maps the top-level name to its subparser.
+    for action in getattr(parser, "_subparsers", None)._group_actions if getattr(parser, "_subparsers", None) else []:
+        subparsers = action
+        break
+    else:
+        return
+    existing = set(subparsers.choices)
+    for reg in registry.cli_commands:
+        if not reg.path:
+            continue
+        top, *rest = reg.path
+        if top in existing:
+            print(
+                f"pymss: warning: plugin '{reg.source}' command '{' '.join(reg.path)}' "
+                f"collides with builtin command '{top}'; skipped",
+                file=sys.stderr,
+            )
+            continue
+        sub = subparsers.add_parser(
+            top,
+            help=f"[plugin:{reg.source}] {reg.help}".strip(),
+        )
+        if reg.add_arguments is not None:
+            try:
+                reg.add_arguments(sub)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"pymss: warning: plugin '{reg.source}' add_arguments failed: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+        sub.set_defaults(func=reg.func)
+        existing.add(top)
+        if rest:
+            print(
+                f"pymss: warning: plugin '{reg.source}' command '{' '.join(reg.path)}' "
+                f"uses a multi-segment path; only '{top}' is exposed",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":

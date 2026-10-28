@@ -2,6 +2,8 @@
 from .jobs import committed_files
 from .provider import profile_output_contract
 
+# The discovery envelope stays compatible with deployed Gateway consumers.
+# Export capabilities are versioned by immutable profile ID/version/digest.
 CONTRACT_VERSION = "2026-10-23.v1"
 
 
@@ -12,8 +14,8 @@ def submission(payload):
                "inputs", "input_paths", "output_dir", "options"}
     if set(payload) - allowed:
         raise ValueError("unsupported request fields: " + ", ".join(sorted(set(payload) - allowed)))
-    if not isinstance(payload.get("options", {}), dict) or payload.get("options"):
-        raise ValueError("this provider accepts only empty options")
+    if not isinstance(payload.get("options", {}), dict):
+        raise ValueError("options must be an object")
     for first, second in (("profile_id", "profile"), ("inputs", "input_paths")):
         if first in payload and second in payload and payload[first] != payload[second]:
             raise ValueError(f"{first} and {second} must agree")

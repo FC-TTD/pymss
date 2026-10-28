@@ -162,13 +162,15 @@ _BUILTIN_CODECS = {
 
 
 def register_builtin_codecs() -> None:
-    """Register all built-in format encoders as capabilities.
+    """Register all built-in format encoders as capabilities (idempotent).
 
-    Each format F registers a capability named f"{F}_encode". Idempotent.
+    Each format F registers a capability named f"{F}_encode". A capability
+    that already exists is never overwritten — neither a repeat builtin
+    registration nor one over a plugin-provided encoder for the same format.
     """
     for fmt, (func, _default_params) in _BUILTIN_CODECS.items():
         name = f"{fmt}_encode"
-        if name in _REGISTRY.capabilities and _REGISTRY.capabilities[name].source == "builtin":
+        if name in _REGISTRY.capabilities:
             continue
         _REGISTRY.register_capability(
             name, func, source="builtin", description=f"encode audio to {fmt}"
@@ -176,11 +178,14 @@ def register_builtin_codecs() -> None:
 
 
 def supported_formats() -> list[str]:
-    """Return the list of formats with a registered {fmt}_encode capability."""
+    """Return formats with a registered {fmt}_encode capability (any source).
+
+    Plugin-registered encoders are included so new formats are discoverable.
+    """
     return sorted(
         name[:-len("_encode")]
         for name in _REGISTRY.capabilities
-        if name.endswith("_encode") and _REGISTRY.capabilities[name].source == "builtin"
+        if name.endswith("_encode")
     )
 
 

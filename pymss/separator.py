@@ -7,15 +7,17 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 import torch
 import numpy as np
+from yaml import YAMLError
 import platform
 import subprocess
 from time import time
 from tqdm import tqdm
 
-from .audio_io import load_audio, save_audio
+from .audio_io import downmix_to_stereo, load_audio, save_audio
 from .utils import _resolve_use_amp, clear_mlx_cache, demix, get_model_from_config
 from .logger import get_separation_logger, set_log_level
-from .config import AttrDict
+from .config import AttrDict, load_config
+from pymss_core import ModelTypeDetectionError, clear_model_runtime_caches, detect_model_type
 
 
 INFERENCE_PARAM_TARGETS = {
@@ -35,7 +37,6 @@ INFERENCE_PARAM_TARGETS = {
     "cuda_attention_backend": "inference",
     "mps_attention_backend": "inference",
     "mps_mlx_min_tokens": "inference",
-    "mps_mlx_clear_cache": "inference",
     "mps_model_backend": "inference",
     "mps_model_compute_dtype": "inference",
     "fuse_conv_bn": "inference",
@@ -56,7 +57,6 @@ PASSTHROUGH_INFERENCE_PARAMS = frozenset(
         "use_amp",
         "cuda_attention_backend",
         "mps_attention_backend",
-        "mps_mlx_clear_cache",
         "mps_model_backend",
         "mps_model_compute_dtype",
         "fuse_conv_bn",
@@ -84,6 +84,18 @@ OUTPUT_NORMALIZE_TARGET_DBFS = -0.01
 OUTPUT_NORMALIZE_PEAK = 10 ** (OUTPUT_NORMALIZE_TARGET_DBFS / 20)
 
 
+def _npu_runtime_available():
+    """Return True when torch_npu is importable and reports an available NPU."""
+    try:
+        import torch_npu  # noqa: F401  (registers the npu backend on import)
+    except Exception:
+        return False
+    try:
+        return torch.npu.is_available()
+    except Exception:
+        return False
+
+
 def _resolve_public_device(device, inference_params, logger):
     """Resolve public device.
 
@@ -101,7 +113,6 @@ def _resolve_public_device(device, inference_params, logger):
             raise RuntimeError("device='mlx' requires Apple Silicon MPS support")
         inference_params.setdefault("mps_model_backend", "mlx_full")
         inference_params.setdefault("mps_model_compute_dtype", "float16")
-        inference_params.setdefault("mps_mlx_clear_cache", True)
         logger.debug("Mapping device='mlx' to device='mps' with MLX full model backend")
         return "mps", inference_params
     if requested_device == "rocm":
@@ -109,8 +120,13 @@ def _resolve_public_device(device, inference_params, logger):
             raise RuntimeError("device='rocm' requires a ROCm-enabled PyTorch build with a visible HIP device")
         logger.debug("Mapping device='rocm' to device='cuda' (ROCm PyTorch exposes HIP devices as cuda)")
         return "cuda", inference_params
+    if requested_device == "npu":
+        if not _npu_runtime_available():
+            raise RuntimeError("device='npu' requires the torch_npu package with an available Ascend device")
+        logger.debug("Using Ascend NPU through torch_npu")
+        return "npu", inference_params
     if requested_device not in {"auto", "cpu", "cuda", "mps"}:
-        raise ValueError("device must be 'auto', 'cpu', 'cuda', 'mps', 'rocm', or 'mlx'")
+        raise ValueError("device must be 'auto', 'cpu', 'cuda', 'mps', 'rocm', 'npu', or 'mlx'")
     return requested_device, inference_params
 
 
@@ -124,13 +140,46 @@ def _select_device(device, device_ids, logger):
 
     Returns:
         Any: Computed result."""
-    if device not in ["cpu", "cuda", "mps"]:
-        if torch.cuda.is_available():
+    if device == "npu":
+        device_count = torch.npu.device_count()
+        if not isinstance(device_ids, (list, tuple)) or not device_ids or any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in device_ids
+        ):
+            raise ValueError("NPU device_ids must be a non-empty list of non-negative integers")
+        invalid_ids = [index for index in device_ids if index >= device_count]
+        if invalid_ids:
+            raise ValueError(f"NPU device ID(s) {invalid_ids} are outside the available range [0, {device_count})")
+        logger.debug("Ascend NPU is available through torch_npu, setting Torch device to NPU")
+        return f"npu:{device_ids[0]}"
+    if device not in ["cpu", "mps"]:
+        cuda_available = torch.cuda.is_available()
+        if device == "cuda" and not cuda_available:
+            raise RuntimeError("device='cuda' requires a CUDA or ROCm-enabled PyTorch build with an available GPU")
+        if cuda_available:
+            if not isinstance(device_ids, (list, tuple)) or not device_ids or any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in device_ids
+            ):
+                raise ValueError("CUDA device_ids must be a non-empty list of non-negative integers")
+            device_count = torch.cuda.device_count()
+            invalid_ids = [index for index in device_ids if index >= device_count]
+            if invalid_ids:
+                raise ValueError(f"CUDA device ID(s) {invalid_ids} are outside the available range [0, {device_count})")
             if getattr(torch.version, "hip", None):
                 logger.debug("ROCm/HIP device is available in Torch, setting Torch device to CUDA device (backed by ROCm)")
             else:
                 logger.debug("CUDA is available in Torch, setting Torch device to CUDA")
             return f"cuda:{device_ids[0]}"
+        if _npu_runtime_available():
+            npu_count = torch.npu.device_count()
+            if not isinstance(device_ids, (list, tuple)) or not device_ids or any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in device_ids
+            ):
+                raise ValueError("NPU device_ids must be a non-empty list of non-negative integers")
+            invalid_ids = [index for index in device_ids if index >= npu_count]
+            if invalid_ids:
+                raise ValueError(f"NPU device ID(s) {invalid_ids} are outside the available range [0, {npu_count})")
+            logger.debug("auto device selected Ascend NPU through torch_npu")
+            return f"npu:{device_ids[0]}"
         if torch.backends.mps.is_available():
             logger.debug("Apple Silicon MPS/CoreML is available in Torch, setting Torch device to MPS")
             return "mps"
@@ -156,10 +205,7 @@ def _prefer_mlx_for_auto(requested_device, selected_device, inference_params, lo
         if "mps_model_backend" not in inference_params:
             inference_params["mps_model_backend"] = "mlx_full"
             inference_params.setdefault("mps_model_compute_dtype", "float16")
-            inference_params.setdefault("mps_mlx_clear_cache", True)
             logger.debug("Auto device selected MPS, enabling MLX full model backend")
-        elif inference_params.get("mps_model_backend") == "mlx_full":
-            inference_params.setdefault("mps_mlx_clear_cache", True)
     return inference_params
 
 
@@ -434,16 +480,16 @@ def _apply_inferred_runtime_config(config, model_kwargs_override, model_path, lo
             )
 
 
-def _store_torch_model_on_cpu_for_mlx(config, device):
-    """Implement the store torch model on cpu for mlx helper.
+def _store_torch_model_on_cpu_for_mlx(model, device):
+    """Keep weights on CPU only when the model actually uses full MLX inference.
 
     Args:
-        config (AttrDict | dict): Loaded pymss configuration.
+        model (torch.nn.Module): Model after runtime backend selection.
         device (Any): Device value.
 
     Returns:
         Any: Computed result."""
-    return torch.device(device).type == "mps" and config.inference.get("mps_model_backend", "torch") == "mlx_full"
+    return torch.device(device).type == "mps" and getattr(model, "mps_model_backend", "torch") == "mlx_full"
 
 
 def _coerce_mps_float64(module):
@@ -474,18 +520,16 @@ def _coerce_cpu_low_precision(module):
                 child._buffers[name] = buffer.float()
 
 
-def _model_is_stereo(model_type, config):
-    """Implement the model is stereo helper.
-
-    Args:
-        model_type (Any): Model type value.
-        config (AttrDict | dict): Loaded pymss configuration.
-
-    Returns:
-        Any: Computed result."""
+def _model_input_channels(model_type, config, model=None):
+    """Return the model's input channel count, or None for flexible models."""
     if model_type == "vr":
-        return True
-    if model_type in [
+        return 2
+    if model_type == "apollo":
+        return None
+    model = getattr(model, "module", model)
+    channels = getattr(model, "audio_channels", None)
+    model_config = config.get("model", {})
+    if channels is None and model_type in [
         "bs_roformer",
         "bs_roformer_hyperace",
         "bs_conformer",
@@ -493,41 +537,42 @@ def _model_is_stereo(model_type, config):
         "mel_band_conformer",
         *LEGACY_DEMUCS_MODEL_TYPES,
     ]:
-        return config.model.get("stereo", True)
-    return True
+        default_stereo = model_type in LEGACY_DEMUCS_MODEL_TYPES
+        channels = 2 if getattr(model, "stereo", model_config.get("stereo", default_stereo)) else 1
+    if channels is None:
+        if model_type == "mdx23c":
+            channels = config.get("audio", {}).get("num_channels", 2)
+        elif model_type == "htdemucs":
+            channels = config.get("training", {}).get("channels", 2)
+        elif model_type == "bandit":
+            channels = model_config.get("in_channel", 2)
+        elif model_type == "bandit_v2":
+            channels = getattr(model, "in_channels", config.get("kwargs", {}).get("in_channels", 2))
+        else:
+            channels = model_config.get("audio_channels", 2)
+    channels = int(channels)
+    if channels not in (1, 2):
+        raise ValueError(f"Expected a mono or stereo model, got {channels} input channels.")
+    return channels
 
 
-def _prepare_mix_channels(mix, is_stereo, logger):
-    """Implement the prepare mix channels helper.
-
-    Args:
-        mix (np.ndarray): Mix value.
-        is_stereo (Any): Is stereo value.
-        logger (logging.Logger | None): Optional logger for progress messages.
-
-    Returns:
-        Any: Computed result."""
+def _prepare_mix_channels(mix, is_stereo, logger, sample_rate=44100, channel_layout=None):
+    """Adapt one inference input to the model's channel count."""
     from .plugins.builtins import to_mono
 
-    if is_stereo and len(mix.shape) == 1:
+    mix = mix[None, :] if mix.ndim == 1 else mix
+    if is_stereo and mix.shape[0] == 1:
         if logger:
-            logger.warning("Track is mono, but model is stereo, adding a second channel.")
-        return np.stack([mix, mix], axis=0)
-    if is_stereo and len(mix.shape) == 2 and mix.shape[0] == 1:
-        # [1, N] channel-first mono (e.g. graph AudioArtifact normalizes 1-D
-        # arrays to [1, N]) — duplicate the channel for stereo models.
+            logger.debug("Duplicating mono input for stereo model inference.")
+        return np.repeat(mix, 2, axis=0)
+    if is_stereo and mix.shape[0] > 2:
         if logger:
-            logger.warning("Track is mono, but model is stereo, adding a second channel.")
-        return np.concatenate([mix, mix], axis=0)
-    if is_stereo and len(mix.shape) > 2:
-        logger.warning("Track has more than 2 channels, taking mean of all channels and adding a second channel.")
-        mono = to_mono(mix)
-        return np.stack([mono, mono], axis=0)
-    if not is_stereo:
-        if len(mix.shape) != 1:
-            logger.warning("Track has more than 1 channels, but model is mono, taking mean of all channels.")
-            return to_mono(mix)[None, :]
-        return mix[None, :]
+            logger.info("Downmixing multichannel input to stereo for model inference.")
+        return downmix_to_stereo(mix, sample_rate, channel_layout)
+    if not is_stereo and mix.shape[0] > 1:
+        if logger:
+            logger.info("Averaging input channels for mono model inference.")
+        return to_mono(mix)[None, :]
     return mix
 
 
@@ -577,7 +622,7 @@ def _normalize_outputs(results, enabled, logger, target_peak=OUTPUT_NORMALIZE_PE
         return results
 
     logger.debug(f"Normalize output stems with peak: {peak}, target_peak: {target_peak}")
-    return {stem: normalize_peak(audio, target_peak=target_peak) for stem, audio in results.items()}
+    return {stem: normalize_peak(audio, target_peak=target_peak, reference_peak=peak) for stem, audio in results.items()}
 
 
 def _destandardize(estimates, stats):
@@ -695,6 +740,28 @@ def _resolve_instruments(config, stems=None):
     return selected, source_indices
 
 
+def _apply_target_instrument_override(config, override, logger=None):
+    """Correct inaccurate target metadata without modifying the downloaded YAML."""
+    if override is None or not str(override).strip():
+        return config
+    requested = str(override).strip()
+    instruments = list(config.training.instruments)
+    match = next((item for item in instruments if str(item).casefold() == requested.casefold()), None)
+    if match is None:
+        raise ValueError(
+            f"target_instrument_override {requested!r} is not present in configured instruments: {instruments}"
+        )
+    previous = config.training.target_instrument
+    config.training.target_instrument = match
+    if logger is not None and previous != match:
+        logger.info(
+            "Correcting model target instrument metadata from %r to %r.",
+            previous,
+            match,
+        )
+    return config
+
+
 def _get_store_dir(store_dirs, instr):
     """Return store dir.
 
@@ -759,7 +826,9 @@ class MSSeparator:
     or need full control over runtime parameters.
 
     Args:
-        model_type (str): Model architecture/runtime type. Common values
+        model_type (str): Model architecture/runtime type, or ``auto`` to detect
+            it from the YAML configuration. Unknown or ambiguous configurations
+            raise ``ModelTypeDetectionError`` (a ``RuntimeError``) before loading weights. Common explicit values
             include ``bs_roformer``, ``bs_conformer``, ``mel_band_roformer``,
             ``mel_band_conformer``, ``htdemucs``, ``mdx23c``, ``bandit``,
             ``bandit_v2``, ``scnet``, ``apollo``, ``vr``, ``legacy_demucs``,
@@ -811,6 +880,11 @@ class MSSeparator:
             ``stem_batch_size``, ``standardize``, ``normalize``, ``mask_mode``,
             attention backend options, and VR-specific options such as
             ``aggression`` and ``window_size``.
+        target_instrument_override (str | None, optional): Corrects an
+            inaccurate ``training.target_instrument`` value in a model YAML.
+            Catalog name loaders apply known corrections automatically. Explicit
+            model files keep the YAML target unless an override is supplied.
+            Defaults to None.
 
     Example:
         >>> separator = MSSeparator.from_model_name(
@@ -866,11 +940,14 @@ class MSSeparator:
             "normalize": False,
             "mask_mode": None,
         },
+        target_instrument_override=None,
     ):
         """Initialize and load a separator from explicit model files.
 
         Args:
-            model_type (str): Runtime model family. Catalog users usually get
+            model_type (str): Runtime model family, or ``auto`` to detect it
+                from YAML. Unknown or ambiguous configurations raise ModelTypeDetectionError.
+                Catalog users usually get
                 this value from ``MSSeparator.from_model_name()`` instead of
                 setting it manually.
             model_path (str | os.PathLike): Model weights path.
@@ -910,6 +987,10 @@ class MSSeparator:
                 values keep model config defaults. ``standardize`` controls
                 legacy input standardization, and ``normalize`` controls linked
                 output peak normalization.
+            target_instrument_override (str | None, optional): Corrects an
+                inaccurate target stem declaration while retaining the YAML's
+                configured instrument names. Defaults to None, preserving the
+                target declared in explicit model files.
 
         Returns:
             None: The separator is loaded and ready for inference.
@@ -927,13 +1008,22 @@ class MSSeparator:
             raise ValueError("model_path is required")
 
         logger = logger if logger is not None else get_separation_logger()
-        device, inference_params = _resolve_public_device(device, inference_params, logger)
 
         self.model_type = model_type
 
         self.model_path = model_path
         self.config_path_given = config_path is not None
-        self.config_path = config_path if config_path else (model_path + ".yaml")
+        self.config_path = config_path if config_path else (os.fspath(model_path) + ".yaml")
+        if self.model_type == "auto":
+            try:
+                model_config = load_config(self.config_path)
+            except (OSError, UnicodeError, YAMLError) as exc:
+                raise ModelTypeDetectionError(
+                    "Cannot determine model_type: auto requires a readable YAML configuration. "
+                    "Check config_path or set model_type explicitly."
+                ) from exc
+            self.model_type = detect_model_type(model_config)
+        device, inference_params = _resolve_public_device(device, inference_params, logger)
         self.output_format = output_format
         self.use_tta = use_tta
         self.store_dirs = store_dirs
@@ -944,6 +1034,7 @@ class MSSeparator:
         self.progress_callback = progress_callback
         self.inference_params = inference_params
         self.output_normalize = self.inference_params.get("normalize", False)
+        self.target_instrument_override = target_instrument_override
 
         if self.debug:
             set_log_level(self.logger, logging.DEBUG)
@@ -956,6 +1047,12 @@ class MSSeparator:
         self.device_ids = device_ids
         self.device = _select_device(device, self.device_ids, self.logger)
         self.inference_params = _prefer_mlx_for_auto(device, self.device, self.inference_params, self.logger)
+        if torch.device(self.device).type == "npu":
+            from pymss_core.npu_rnn import install_npu_rnn_fallback
+
+            # torch_npu LSTM/GRU kernels lack aclnn implementations on current
+            # builds; bounce recurrent cells through CPU instead of faulting.
+            install_npu_rnn_fallback()
 
         self._cudnn_benchmark_initial = torch.backends.cudnn.benchmark
         torch.backends.cudnn.benchmark = True
@@ -1067,6 +1164,8 @@ class MSSeparator:
             resolved,
             kwargs.pop("inference_params", None),
         )
+        if resolved.get("target_instrument_override") and kwargs.get("target_instrument_override") is None:
+            kwargs["target_instrument_override"] = resolved["target_instrument_override"]
         return cls(
             model_type=resolved["model_type"],
             model_path=resolved["model_path"],
@@ -1155,6 +1254,7 @@ class MSSeparator:
                     },
                 }
             )
+            _apply_target_instrument_override(config, self.target_instrument_override, self.logger)
             self.update_inference_params(config, self.inference_params)
             common_config = {
                 "logger": self.logger,
@@ -1175,11 +1275,12 @@ class MSSeparator:
             return model, config
 
         if self.model_type in LEGACY_DEMUCS_MODEL_TYPES:
-            from .modules.legacy_demucs import load_legacy_demucs_model
+            from pymss_core.modules.legacy_demucs import load_legacy_demucs_model
 
             config_path = self.config_path if self.config_path_given else None
             model, config = load_legacy_demucs_model(self.model_path, config_path)
             config = AttrDict(config)
+            _apply_target_instrument_override(config, self.target_instrument_override, self.logger)
             self.update_inference_params(config, self.inference_params)
             model = model.to(self.device)
             model.eval()
@@ -1202,6 +1303,7 @@ class MSSeparator:
         with init_context:
             model, config = get_model_from_config(model_type, self.config_path, model_kwargs_override=model_kwargs_override)
 
+        _apply_target_instrument_override(config, self.target_instrument_override, self.logger)
         _apply_inferred_runtime_config(config, model_kwargs_override, self.model_path, self.logger)
         self.update_inference_params(config, self.inference_params)
         self.apply_model_inference_config(model, config)
@@ -1217,14 +1319,37 @@ class MSSeparator:
         if torch.device(self.device).type == "cpu":
             _coerce_cpu_low_precision(model)
 
-        keep_torch_model_cpu = _store_torch_model_on_cpu_for_mlx(config, self.device)
-        if len(self.device_ids) > 1 and not keep_torch_model_cpu:
+        keep_torch_model_cpu = _store_torch_model_on_cpu_for_mlx(model, self.device)
+        if len(self.device_ids) > 1 and torch.device(self.device).type == "cuda" and not keep_torch_model_cpu:
             model = torch.nn.DataParallel(model, device_ids=self.device_ids)
         model = model.to("cpu" if keep_torch_model_cpu else self.device)
         model.eval()
+        self._warmup_mlx_full_backend(model, config)
 
         self.logger.debug(f"Loading model completed, duration: {time() - start_time:.2f} seconds")
         return model, config
+
+    def _warmup_mlx_full_backend(self, model, config):
+        # pre-build the MLX full backend so the first batch is not the peak; failures downgrade to torch
+        if torch.device(self.device).type != "mps":
+            return
+        if getattr(model, "mps_model_backend", "") != "mlx_full":
+            return
+        from .utils import warmup_mlx_full
+
+        warmup_start = time()
+        if warmup_mlx_full(model, config):
+            self.logger.debug(f"MLX full warmup completed, duration: {time() - warmup_start:.2f} seconds")
+            return
+        self.logger.warning(
+            f"MLX full warmup failed for {type(model).__name__} "
+            f"({getattr(model, '_pymss_mlx_full_backend_error', 'unknown error')}); using 'torch'"
+        )
+        model.mps_model_backend = "torch"
+        params = getattr(model, "parameters", None)
+        first = next(params(), None) if callable(params) else None
+        if first is not None and first.device.type != torch.device(self.device).type:
+            model.to(self.device)  # MLX full loads weights on CPU; move them back for the torch path
 
     def _log_model_config(self, model_type, config, config_path=None, include_config_path=True):
         """Log resolved separator, audio, and model inference settings.
@@ -1291,6 +1416,12 @@ class MSSeparator:
             for module in model.modules():
                 if hasattr(module, "set_mps_model_backend"):
                     module.set_mps_model_backend(model_backend, compute_dtype)
+            effective_backend = getattr(model, "mps_model_backend", "torch")
+            if effective_backend != model_backend:
+                self.logger.warning(
+                    f"Requested MPS model backend {model_backend!r} is unavailable for "
+                    f"{type(model).__name__}; using {effective_backend!r}"
+                )
         backend = config.inference.get("mps_attention_backend", None)
         min_tokens = config.inference.get("mps_mlx_min_tokens", 128)
         if backend is not None:
@@ -1403,7 +1534,7 @@ class MSSeparator:
         return save_ok
 
     @staticmethod
-    def _submit_load(load_executor, paths, index, sample_rate):
+    def _submit_load(load_executor, paths, index, sample_rate, downmix_stereo=False):
         """Submit the next audio load job to the load executor.
 
         Args:
@@ -1415,7 +1546,9 @@ class MSSeparator:
         Returns:
             concurrent.futures.Future | None: Future for the submitted load, or
             None when ``index`` is outside ``paths``."""
-        return None if index >= len(paths) else load_executor.submit(load_audio, paths[index], sr=sample_rate, mono=False)
+        return None if index >= len(paths) else load_executor.submit(
+            load_audio, paths[index], sr=sample_rate, mono=False, downmix_stereo=downmix_stereo
+        )
 
     def _submit_save_outputs(self, save_executor, results, sr, file_name):
         """Submit save jobs for all returned stems.
@@ -1563,6 +1696,7 @@ class MSSeparator:
         )
 
         success_files, pending_saves = [], deque()
+        downmix_stereo = _model_input_channels(self.model_type, self.config, self.model) != 1
 
         progress = tqdm(all_mixtures_path, desc="Total progress") if not self.debug else None
         try:
@@ -1570,7 +1704,7 @@ class MSSeparator:
                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="pymss-load") as load_executor,
                 ThreadPoolExecutor(max_workers=2, thread_name_prefix="pymss-save") as save_executor,
             ):
-                load_future = self._submit_load(load_executor, all_mixtures_path, 0, sample_rate)
+                load_future = self._submit_load(load_executor, all_mixtures_path, 0, sample_rate, downmix_stereo)
 
                 for index, path in enumerate(all_mixtures_path):
                     mix = None
@@ -1581,10 +1715,12 @@ class MSSeparator:
                         mix, sr = load_future.result()
                     except Exception as e:
                         self.logger.warning(f"Cannot process track: {path}, error: {str(e)}")
-                        load_future = self._submit_load(load_executor, all_mixtures_path, index + 1, sample_rate)
+                        load_future = self._submit_load(
+                            load_executor, all_mixtures_path, index + 1, sample_rate, downmix_stereo
+                        )
                         continue
 
-                    load_future = self._submit_load(load_executor, all_mixtures_path, index + 1, sample_rate)
+                    load_future = self._submit_load(load_executor, all_mixtures_path, index + 1, sample_rate, downmix_stereo)
 
                     self.logger.debug(f"Starting separation process for audio_file: {path}")
                     try:
@@ -1620,20 +1756,26 @@ class MSSeparator:
                 progress.close()
         return success_files
 
-    def separate(self, mix, pbar=True, stems=None):
+    def separate(self, mix, pbar=True, stems=None, *, channel_layout=None):
         """Run separation on an already loaded audio array.
 
         Args:
-            mix (np.ndarray): Input waveform. Mono and stereo arrays are
-                accepted; channel layout is adjusted to match the model.
+            mix (np.ndarray): Input waveform shaped ``(samples,)`` or
+                ``(channels, samples)``. Mono and stereo inputs retain their
+                channel count in the output. Multichannel inputs produce mono
+                output with mono models, and stereo output with stereo models.
             pbar (bool, optional): Whether lower-level inference may display
                 progress bars. Defaults to True.
             stems (str | Sequence[str] | None, optional): Stem name or stem
                 names to return. ``None`` returns all model stems. Defaults to
                 None.
+            channel_layout (str | None, optional): Source layout for
+                multichannel arrays, such as ``"5.1(side)"``. When omitted,
+                FFmpeg's default layout for the channel count is used.
 
         Returns:
-            dict[str, np.ndarray]: Mapping of stem name to separated audio.
+            dict[str, np.ndarray]: Mapping of stem name to sample-major audio,
+                normally shaped ``(samples, channels)``.
 
         Example:
             >>> results = separator.separate(audio, stems=["vocals", "instrumental"])
@@ -1642,9 +1784,9 @@ class MSSeparator:
         Notes:
             When output ``normalize=True``, the shared normalization gain is
             computed only across the returned stems."""
-        return self._separate(mix, pbar=pbar, stems=stems)
+        return self._separate(mix, pbar=pbar, stems=stems, channel_layout=channel_layout)
 
-    def _separate(self, mix, pbar, stems=None):
+    def _separate(self, mix, pbar, stems=None, channel_layout=None):
         """Internal separation implementation.
 
         Args:
@@ -1661,9 +1803,26 @@ class MSSeparator:
             standardization when enabled, runs TTA variants when requested,
             builds stem results, and finally applies linked output peak
             normalization when ``self.output_normalize`` is true."""
-        mix = _prepare_mix_channels(mix, _model_is_stereo(self.model_type, self.config), self.logger)
+        mix = np.asarray(mix, dtype=np.float32)
+        if mix.ndim not in (1, 2) or not mix.size:
+            raise ValueError("Expected non-empty audio shaped (samples,) or (channels, samples).")
+        input_channels = 1 if mix.ndim == 1 else mix.shape[0]
+        model_channels = _model_input_channels(self.model_type, self.config, self.model)
+        sample_rate = self.config.audio.get("sample_rate", 44100)
+        split_stereo = input_channels == 2 and model_channels == 1
+        if split_stereo:
+            self.logger.info("Separating left and right channels independently with a mono model.")
+            mixes = [mix[:1], mix[1:2]]
+        else:
+            is_stereo = model_channels == 2 or (model_channels is None and input_channels > 1)
+            mixes = [_prepare_mix_channels(mix, is_stereo, self.logger, sample_rate, channel_layout)]
         if self.model_type == "vr":
-            results = self.model.separate_array(mix, self.config.audio.get("sample_rate", 44100))
+            # Graph callers assign the callback after the VR child is loaded.
+            self.model.progress_callback = self.progress_callback
+            results = self.model.separate_array(mixes[0], sample_rate)
+            if input_channels == 1:
+                results = {stem: audio.mean(axis=1, keepdims=True) if audio.ndim == 2 else audio
+                           for stem, audio in results.items()}
             return _normalize_outputs(results, self.output_normalize, self.logger)
 
         instruments, source_indices = _resolve_instruments(self.config, stems)
@@ -1672,26 +1831,38 @@ class MSSeparator:
                 "Target instrument is not null, set primary_stem to target_instrument, secondary_stem will be calculated by mix - target_instrument"
             )
 
-        mix_orig = mix.copy()
-        mix, standardize_stats = _standardize_mix(mix, self.config.inference.get("normalize", False), self.logger)
-        full_result = [
-            demix(
-                self.config,
-                self.model,
-                track,
-                self.device,
-                pbar=pbar,
-                model_type=self.model_type,
-                source_indices=source_indices,
-                progress_callback=self.progress_callback,
+        channel_results = []
+        variants_per_mix = 3 if self.use_tta else 1
+        passes = len(mixes) * variants_per_mix
+        for channel_index, channel_mix in enumerate(mixes):
+            mix_orig = channel_mix.copy()
+            prepared, standardize_stats = _standardize_mix(
+                channel_mix, self.config.inference.get("normalize", False), self.logger
             )
-            for track in _tta_variants(mix, self.use_tta, self.logger)
-        ]
+            full_result = []
+            for variant_index, track in enumerate(_tta_variants(prepared, self.use_tta, self.logger)):
+                callback = self.progress_callback
+                if callback is not None and passes > 1:
+                    pass_index = channel_index * variants_per_mix + variant_index
 
-        self.logger.debug("Finished demixing tracks.")
-        waveforms = _merge_tta_results(full_result)
-        self.logger.debug(f"Starting to extract waveforms for instruments: {instruments}")
-        results = _build_results(waveforms, instruments, mix_orig, self.config, standardize_stats, self.logger)
+                    def callback(done, total, message, pass_index=pass_index):
+                        self.progress_callback(pass_index * total + done, passes * total, message)
+
+                full_result.append(demix(
+                    self.config, self.model, track, self.device, pbar=pbar,
+                    model_type=self.model_type, source_indices=source_indices, progress_callback=callback,
+                ))
+            waveforms = _merge_tta_results(full_result)
+            channel_results.append(
+                _build_results(waveforms, instruments, mix_orig, self.config, standardize_stats, self.logger)
+            )
+
+        results = channel_results[0]
+        if split_stereo:
+            results = {stem: np.column_stack((audio, channel_results[1][stem])) for stem, audio in results.items()}
+        elif input_channels == 1:
+            results = {stem: audio.mean(axis=1, keepdims=True) if audio.ndim == 2 else audio
+                       for stem, audio in results.items()}
         results = _normalize_outputs(results, self.output_normalize, self.logger)
         self.logger.debug("Separation process completed.")
         return results
@@ -1731,20 +1902,25 @@ class MSSeparator:
         self.logger.debug("Closing separator and releasing model references...")
         model = getattr(self, "model", None)
         try:
-            if self.model_type == "vr" and model is not None:
-                model_run = getattr(model, "model_run", None)
-                if model_run is not None and hasattr(model_run, "to"):
+            cache_model = getattr(model, "model_run", None) if self.model_type == "vr" else model
+            try:
+                if isinstance(cache_model, torch.nn.Module):
+                    clear_model_runtime_caches(cache_model)
+            finally:
+                if self.model_type == "vr" and model is not None:
+                    model_run = getattr(model, "model_run", None)
+                    if model_run is not None and hasattr(model_run, "to"):
+                        try:
+                            model_run.to("cpu")
+                        except Exception as exc:
+                            self.logger.debug(f"Could not move VR model to CPU during close: {exc}")
+                    if hasattr(model, "model_run"):
+                        model.model_run = None
+                elif model is not None and hasattr(model, "to"):
                     try:
-                        model_run.to("cpu")
+                        model.to("cpu")
                     except Exception as exc:
-                        self.logger.debug(f"Could not move VR model to CPU during close: {exc}")
-                if hasattr(model, "model_run"):
-                    model.model_run = None
-            elif model is not None and hasattr(model, "to"):
-                try:
-                    model.to("cpu")
-                except Exception as exc:
-                    self.logger.debug(f"Could not move model to CPU during close: {exc}")
+                        self.logger.debug(f"Could not move model to CPU during close: {exc}")
         finally:
             self._restore_cudnn_benchmark()
             self.model = None
@@ -1789,3 +1965,6 @@ class MSSeparator:
         if "cuda" in self.device:
             self.logger.debug("Clearing CUDA cache...")
             torch.cuda.empty_cache()
+        if "npu" in self.device:
+            self.logger.debug("Clearing NPU cache...")
+            torch.npu.empty_cache()

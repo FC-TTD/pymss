@@ -4,10 +4,12 @@
 原WebUI另在`FC-TTD/pymss-webui`的`hub`分支保留。
 
 最初接管以原edge手工preview的实际成果为基线，保留管理员改动后新增
-`hub_runtime/`和`deploy/hub/`。当前工作分支将源码升级到上游2.1.5，
+`hub_runtime/`和`deploy/hub/`。当前集成将源码升级到上游2.1.12/core 0.1.14，
 保留必要兼容补丁；这不代表线上已升级。验证范围见
-[2.1.5升级记录](docs/hub-takeover/upgrade-2.1.5.md)。
-原接口与`pymss-studio`域名、中文工作台、分轨预览、下载与48kHz/24-bit WAV保持。
+[2.1.12升级记录](docs/hub-takeover/upgrade-2.1.12.md)。
+九套 profile 新增 `2026-10-28.v2`，复用 `options.audio_params` 配置导出声道、
+采样率和 PCM 编码；省略参数仍为 WAV/48kHz/PCM24/双声道。`channels` 支持
+`1`、`2`、`"source"`，模型原生声道与导出转换分别声明。既有固定版本继续可用。
 源码接管与实际交接证据见[接管记录](docs/hub-takeover/adoption.md)。
 
 模型权重在SDK独立GPU子进程，API/UI宿主在CPU。请求完成保持热驻留；只在
@@ -23,7 +25,7 @@
 offload。不更改精度/CPU-GPU分工、不纳管独立CPU Only服务。
 
 `python -m hub_runtime describe`导出真实OpenAPI但不加载模型。构建使用固定原
-运行镜像，叠加SDK、2.1.5源码及固定的pymss-core依赖，删除旧版遗留模块，
+运行镜像，叠加SDK、2.1.12源码及固定的pymss-core依赖，使用独立包元数据目录，
 保留原管理员UI静态产物；模型和输出挂载保持，原CUDA依赖不自动升级。
 原GPU接口和CPU入口在`deploy/hub/compose.yml`，原域名和Cover旧内部DNS兼容
 在`business.yml`；只在旧实例正常退出后应用该overlay，避免双后端分流。

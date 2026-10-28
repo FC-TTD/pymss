@@ -35,7 +35,7 @@ SOCKS_PROXY_SCHEMES = {"socks5", "socks5h", "socks4"}
 ARIA2_PROGRESS_PATTERN = re.compile(
     r"\[#\S+\s+(?P<downloaded>[\d.]+\s*[KMGTPE]?i?B)/"
     r"(?P<total>[\d.]+\s*[KMGTPE]?i?B)"
-    r"\((?P<percent>\d+)%\).*?DL:(?P<speed>[\d.]+\s*[KMGTPE]?i?B)",
+    r"(?:\((?P<percent>\d+)%\))?.*?DL:(?P<speed>[\d.]+\s*[KMGTPE]?i?B)",
     re.IGNORECASE,
 )
 BYTE_UNITS = {
@@ -437,9 +437,7 @@ def _parse_aria2_progress(line):
         return None
     total = _parse_human_bytes(match.group("total"))
     done = _parse_human_bytes(match.group("downloaded"))
-    if not total:
-        return None
-    return min(done, total), total, match.group("speed").strip()
+    return min(done, total) if total else done, total, match.group("speed").strip()
 
 
 def _download_file_urllib(url, tmp, dest, expected_size=None, expected_sha256="", timeout=30, progress_callback=None, proxy=None):
@@ -497,6 +495,8 @@ def _download_file_aria2(url, tmp, dest, expected_size=None, expected_sha256="",
         "--continue=true",
         "--console-log-level=warn",
         "--summary-interval=1",
+        "--show-console-readout=true",
+        "--quiet=false",
         "--max-connection-per-server=16",
         "--split=16",
         "--min-split-size=1M",
@@ -535,6 +535,9 @@ def _download_file_aria2(url, tmp, dest, expected_size=None, expected_sha256="",
                     if parsed is None:
                         continue
                     done, total, speed = parsed
+                    # Some servers omit Content-Length; keep their byte updates
+                    # and use catalog metadata when the response has no total.
+                    total = total or expected_size or 0
                     if total and bar.total != total:
                         bar.total = total
                     bar.update(max(0, done - bar.n))

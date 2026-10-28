@@ -13,7 +13,7 @@ from ttd_model_runtime.engine import progress_scope
 from ttd_model_runtime.protocol import AdmissionRejected, HubError, NativeCancelled
 
 from .engine import RECIPES
-from .provider import ProfileRegistry
+from .provider import ProfileRegistry, profile_audio_params
 
 TERMINAL = {"succeeded", "failed", "cancelled", "unknown"}
 
@@ -115,8 +115,10 @@ class Jobs:
 
     def submit(self, recipe=None, paths=None, output_dir=None, *, profile=None, profile_version=None,
                options=None, implementation_version=None):
-        if options is not None and (not isinstance(options, dict) or options):
-            raise ValueError("this provider accepts only empty options")
+        if options is not None and not isinstance(options, dict):
+            raise ValueError("options must be an object")
+        # Copy before persisting or handing execution to another thread.
+        options = json.loads(json.dumps(options or {}))
         if not paths:
             raise ValueError("input_paths are required")
         manifest = None
@@ -130,8 +132,11 @@ class Jobs:
             recipe = manifest.dag
             if implementation_version is not None and implementation_version != manifest.digest:
                 raise ValueError("profile implementation version mismatch")
+            profile_audio_params(manifest, options)
         elif implementation_version is not None:
             raise ValueError("implementation_version requires a profile")
+        elif options:
+            raise ValueError("options require a versioned profile")
         if recipe not in RECIPES and not (manifest and manifest.implementation):
             raise ValueError("a supported recipe or profile is required")
         inputs = []
@@ -151,7 +156,7 @@ class Jobs:
             task = {"id": task_id, "status": "queued", "recipe": recipe,
                     "profile": manifest.to_dict() if manifest is not None else None,
                     "input_paths": inputs, "output_dir": str(output), "files": [],
-                    "options": {}, "cancel_requested": False, "stage": "queued",
+                    "options": options, "cancel_requested": False, "stage": "queued",
                     "started_at": None, "finished_at": None,
                     "processed_files": 0, "total_files": len(inputs), "created_at": time.time()}
             self.store.put(task)
@@ -207,7 +212,8 @@ class Jobs:
                     if task.get("profile") is not None:
                         from .provider import ProfileManifest
                         manifest = ProfileManifest.from_dict(task["profile"])
-                        files = owner.engine.run_profile(task_id, manifest, task["input_paths"], task["output_dir"])
+                        kwargs = {"options": task["options"]} if task["options"] else {}
+                        files = owner.engine.run_profile(task_id, manifest, task["input_paths"], task["output_dir"], **kwargs)
                     else:
                         files = owner.engine.run(task_id, task["recipe"], task["input_paths"], task["output_dir"])
                 if any(item["status"] != "succeeded" for item in files):

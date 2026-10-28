@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,9 @@ from typing import Any, Mapping
 import numpy as np
 
 from ..plugins.registry import _REGISTRY as _PLUGIN_REGISTRY
+
+PROGRESS_EVENT_VERSION = 1
+EXECUTION_EVENT_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +59,7 @@ class AudioArtifact:
     sample_rate: int
     source_path: str = ""
     stem_name: str = ""
+    channel_layout: str | None = None
 
     def __post_init__(self) -> None:
         arr = np.asarray(self.audio, dtype=np.float32)
@@ -64,6 +69,15 @@ class AudioArtifact:
             raise ValueError(f"AudioArtifact expects 1D/2D audio, got shape {arr.shape}")
         self.audio = np.ascontiguousarray(arr, dtype=np.float32)
         self.sample_rate = int(self.sample_rate)
+        if self.channel_layout is not None:
+            from av import AudioLayout
+
+            layout = AudioLayout(self.channel_layout)
+            if len(layout.channels) != arr.shape[0]:
+                raise ValueError("Audio channel layout does not match the waveform channel count.")
+            self.channel_layout = layout.name
+        elif arr.shape[0] in (1, 2):
+            self.channel_layout = "mono" if arr.shape[0] == 1 else "stereo"
 
 
 @dataclass
@@ -290,6 +304,58 @@ class NodeContext:
     nodes_by_id: dict[object, "DAGNode"] = field(default_factory=dict)
     current_node_id: object | None = None
     name_prefix: str = ""
+    progress_event_callback: Callable[[dict[str, Any]], None] | None = None
+    node_index: int = 0
+    node_count: int = 0
+    _overall_fraction: float = 0.0
+    execution_event_callback: Callable[[dict[str, Any]], None] | None = None
+    _node_fraction: float = 0.0
+    _execution_callback_failed: bool = False
+
+    def _emit_execution_event(self, event_type: str, node: DAGNode | None = None,
+                              message: str = "", **details: Any) -> None:
+        if self.execution_event_callback is None:
+            return
+        event = {
+            "event": event_type, "version": EXECUTION_EVENT_VERSION,
+            "node_id": str(node.id) if node is not None else None,
+            "node_type": node.type if node is not None else None,
+            "node_fraction": self._node_fraction if node is not None else None,
+            "overall_fraction": self._overall_fraction,
+            "node_index": self.node_index if node is not None else None,
+            "node_count": self.node_count, "message": message,
+            **details,
+        }
+        self._execution_callback_failed = False
+        try:
+            self.execution_event_callback(event)
+        except BaseException:
+            # Observer errors abort the call, but are not node-execution errors.
+            self._execution_callback_failed = True
+            raise
+
+    def report_progress(self, node: DAGNode, fraction: float, message: str, *,
+                        audio_index: int | None = None, audio_count: int | None = None,
+                        done: int | float | None = None, total: int | float | None = None,
+                        unit: str | None = None, _event_type: str = "node_progress") -> None:
+        """Report structured graph progress without changing legacy callbacks."""
+        if self.progress_event_callback is None and self.execution_event_callback is None:
+            return
+        fraction = min(1.0, max(0.0, fraction))
+        self._node_fraction = fraction
+        self._overall_fraction = max(self._overall_fraction, (self.node_index + fraction) / max(1, self.node_count))
+        event = {"node_id": str(node.id), "node_type": node.type, "overall_fraction": self._overall_fraction,
+                 "node_fraction": fraction, "message": message}
+        if audio_index is not None:
+            event.update(audio_index=audio_index, audio_count=audio_count)
+        if done is not None and total is not None:
+            event.update(done=done, total=total, unit=unit)
+        if self.progress_event_callback is not None:
+            self.progress_event_callback(dict(event))
+        # A separate observer keeps lifecycle events out of the version-1
+        # progress stream, whose consumers may interpret fraction=1 as done.
+        self._emit_execution_event(_event_type, node, **{key: value for key, value in event.items()
+                                                       if key not in {"node_id", "node_type"}})
 
     def require(self, capability_name: str) -> Callable[..., Any]:
         """Look up a capability by name (delegates to the plugin registry)."""
@@ -302,19 +368,23 @@ class NodeContext:
 
 
 class SeparatorCache:
-    """Reuse loaded separators within a single run.
+    """Reuse a bounded number of loaded separators within a run.
 
-    Keyed by a description tuple that captures everything that changes the
-    loaded weights/config. Store-dir/output-format are execution-time concerns
-    and are NOT part of the key.
+    Keys include constructor options so different model configurations do not
+    share an instance.
+
+    One separator is kept by default. Eviction closes the least recently used
+    separator before the next model is loaded. Pass ``max_entries=None`` to
+    explicitly retain the historical unbounded cache.
     """
 
-    def __init__(self, factory: Callable[..., Any] | None = None, *, max_entries: int | None = None) -> None:
-        if max_entries is not None and max_entries < 1:
-            raise ValueError("max_entries must be positive when provided")
+    def __init__(self, factory: Callable[..., Any] | None = None, *, max_entries: int | None = 1) -> None:
+        if max_entries is not None and (isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 1):
+            raise ValueError("max_entries must be a positive integer or None")
         self._entries: dict[str, Any] = {}
+        self._pending_close: Any = None
         self._factory = factory or self._default_factory
-        self._max_entries = max_entries
+        self.max_entries = max_entries
 
     @staticmethod
     def _default_factory(**kwargs: Any) -> Any:
@@ -337,37 +407,39 @@ class SeparatorCache:
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def get(self, **kwargs: Any) -> Any:
+        if self._pending_close is not None:
+            self._close_separator(self._pending_close)
+            self._pending_close = None
         key = self.key_for(**kwargs)
-        entry = self._entries.get(key)
-        if entry is None:
-            # A Hub managed provider can opt into single residency.  DAG
-            # outputs are materialized before the next node asks for a model,
-            # so evicting here keeps the graph's memory contract without
-            # changing the general purpose cache's default multi-model
-            # behavior.
-            if self._max_entries is not None and len(self._entries) >= self._max_entries:
-                old_entries = list(self._entries.values())
-                self._entries.clear()
-                for old in old_entries:
-                    close = getattr(old, "close", None)
-                    if callable(close):
-                        try:
-                            close()
-                        except Exception:  # pragma: no cover - best effort
-                            pass
+        if key in self._entries:
+            entry = self._entries.pop(key)
+        else:
+            while self.max_entries is not None and len(self._entries) >= self.max_entries:
+                oldest = next(iter(self._entries))
+                self._pending_close = self._entries.pop(oldest)
+                self._close_separator(self._pending_close)
+                self._pending_close = None
             entry = self._factory(**kwargs)
-            self._entries[key] = entry
+        self._entries[key] = entry
         return entry
 
+    @staticmethod
+    def _close_separator(separator: Any) -> None:
+        close = getattr(separator, "close", None)
+        if callable(close):
+            close()
+
     def close(self) -> None:
-        for separator in self._entries.values():
-            close = getattr(separator, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:  # pragma: no cover - best-effort cleanup
-                    pass
-        self._entries.clear()
+        entries = list(self._entries.values())
+        self._entries = {}
+        if self._pending_close is not None:
+            entries.append(self._pending_close)
+            self._pending_close = None
+        for separator in entries:
+            try:
+                self._close_separator(separator)
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
 
     def __enter__(self) -> "SeparatorCache":
         return self
@@ -432,7 +504,7 @@ def audio_to_numpy(audio: Artifact) -> tuple[np.ndarray, int]:
 
 
 def numpy_to_audio(
-    value: np.ndarray, sample_rate: int, *, stem_name: str = "", source_path: str = ""
+    value: np.ndarray, sample_rate: int, *, stem_name: str = "", source_path: str = "", channel_layout: str | None = None
 ) -> AudioArtifact:
     arr = np.asarray(value, dtype=np.float32)
     if arr.ndim == 1:
@@ -443,7 +515,21 @@ def numpy_to_audio(
             arr = arr.T
     else:
         raise DAGError(f"unsupported audio shape {arr.shape}")
-    return AudioArtifact(arr, int(sample_rate), source_path=source_path, stem_name=stem_name)
+    return AudioArtifact(arr, int(sample_rate), source_path=source_path, stem_name=stem_name, channel_layout=channel_layout)
+
+
+def _combined_channel_layout(audios: list[AudioArtifact], channels: int) -> str | None:
+    """Keep compatible multichannel positions when combining audio buffers."""
+    if channels <= 2:
+        return "mono" if channels == 1 else "stereo"
+    # A mono input can be broadcast to all channels without reordering them.
+    multichannel = [audio for audio in audios if audio.audio.shape[0] != 1]
+    if any(audio.audio.shape[0] != channels for audio in multichannel):
+        raise DAGError("Cannot combine multichannel audio with different channel counts.")
+    layouts = {audio.channel_layout for audio in multichannel}
+    if len(layouts) > 1:
+        raise DAGError("Cannot combine multichannel audio with different or missing channel layouts.")
+    return next(iter(layouts), None)
 
 
 def string_value(artifact: Artifact) -> str:
@@ -575,6 +661,7 @@ def run_dag(
     logger: Any = None,
     debug: bool = False,
     progress_callback: Callable[[int, int, str | None], None] | None = None,
+    progress_event_callback: Callable[[dict[str, Any]], None] | None = None,
     strict: bool = True,
     model_dir: str | os.PathLike | None = None,
     download: bool = False,
@@ -585,14 +672,25 @@ def run_dag(
     audio_params: dict[str, Any] | None = None,
     separator_cache: SeparatorCache | None = None,
     name_prefix: str = "",
+    node_results: dict[int, Any] | None = None,
+    execution_event_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[str]:
-    """Execute a DAG and return the list of files written by output nodes."""
+    """Execute a DAG and return the list of files written by output nodes.
+
+    ``node_results`` (optional) receives ``{node_id: NodeResult}`` for every
+    executed node — used by graph-backed operations to lift intermediate
+    artifacts as named outputs without forcing a Save node into the graph.
+
+    ``execution_event_callback`` observes lifecycle events independently of
+    legacy progress callbacks. Execution failures and interruptions still
+    propagate to the caller.
+    """
     _load_builtin_nodes()
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
 
     owns_cache = separator_cache is None
-    cache = separator_cache or SeparatorCache()
+    cache = separator_cache if separator_cache is not None else SeparatorCache()
+    ctx: NodeContext | None = None
     try:
         ctx = NodeContext(
             output_dir=output_path,
@@ -612,15 +710,25 @@ def run_dag(
             audio_params=dict(audio_params or {}),
             nodes_by_id={node.id: node for node in dag.nodes},
             name_prefix=name_prefix or "",
+            progress_event_callback=progress_event_callback,
+            execution_event_callback=execution_event_callback,
+            node_count=len(dag.nodes),
         )
 
+        ctx._emit_execution_event("execution_started")
+        _load_builtin_nodes()
+        output_path.mkdir(parents=True, exist_ok=True)
         order = topological_order(dag.nodes)
         total = len(order)
+        ctx.node_count = total
         results: dict[object, NodeResult] = {}
         saved: list[str] = []
         all_records: list[DAGOutputRecord] = []
 
         for index, node in enumerate(order):
+            ctx.node_index = index
+            ctx.current_node_id = node.id
+            ctx._node_fraction = 0.0
             if (
                 not node.signature.inputs
                 and not node.signature.output_names
@@ -641,6 +749,8 @@ def run_dag(
                         )
                     if progress_callback is not None:
                         progress_callback(index + 1, total, f"node={node.id} skipped unknown")
+                    ctx.current_node_id = None
+                    ctx.report_progress(node, 1.0, f"node={node.id} skipped unknown", _event_type="node_skipped")
                     continue
                 raise
 
@@ -670,17 +780,38 @@ def run_dag(
 
             if progress_callback is not None:
                 progress_callback(index, total, f"node={node.id} type={node.type}")
+            ctx.report_progress(node, 0.0, f"node={node.id} type={node.type}", _event_type="node_started")
 
-            ctx.current_node_id = node.id
             result = node_info.execute(ctx, gathered)
             results[node.id] = result
+            if node_results is not None:
+                node_results[node.id] = result
             saved.extend(result.saved_paths)
             all_records.extend(result.saved_records)
 
+            ctx.current_node_id = None
             if progress_callback is not None:
                 progress_callback(index + 1, total, f"node={node.id} type={node.type}")
+            ctx.report_progress(node, 1.0, f"node={node.id} type={node.type}", _event_type="node_completed")
 
+        ctx._overall_fraction = 1.0
+        ctx._emit_execution_event("execution_completed")
         return DAGExecutionResult(saved, records=all_records)
+    except BaseException as exc:
+        if ctx is not None and ctx.execution_event_callback is not None and not ctx._execution_callback_failed:
+            node = ctx.nodes_by_id.get(ctx.current_node_id) if ctx.current_node_id is not None else None
+            status = "cancelled" if isinstance(exc, (KeyboardInterrupt, AsyncCancelledError)) else "failed"
+            try:
+                if node is not None:
+                    ctx._emit_execution_event(f"node_{status}", node, str(exc), error_type=type(exc).__name__)
+                ctx._emit_execution_event(f"execution_{status}", node, str(exc), error_type=type(exc).__name__)
+            except BaseException as notification_error:
+                # Keep the original exception and any explicit cause. The
+                # observer failure is retained as its exception context.
+                if notification_error is exc:
+                    raise
+                raise exc
+        raise
     finally:
         if owns_cache:
             cache.close()

@@ -13,4 +13,7 @@ def default_profiles():
     packaged = ProfileRegistry.from_json(Path(__file__).with_name("profiles-2026-10-23.json"))
     for manifest in packaged.list():
         registry.register(manifest)
+    configurable = ProfileRegistry.from_json(Path(__file__).with_name("profiles-2026-10-28.json"))
+    for manifest in configurable.list():
+        registry.register(manifest)
     return registry
