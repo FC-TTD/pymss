@@ -210,6 +210,7 @@ class VRSeparator(CommonSeparator):
             self.load_model()
         self.primary_source = None
         self.secondary_source = None
+        self._model_output_length = round(self._ensure_stereo(mix).shape[-1] * self.model_samplerate / sample_rate)
         x_spec = self.loading_mix(mix, sample_rate)
         y_spec, v_spec = self.inference_vr(x_spec, self.torch_device, self.aggressiveness)
         y_spec = np.nan_to_num(y_spec, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
@@ -227,7 +228,7 @@ class VRSeparator(CommonSeparator):
 
     def process_stem(self, stem_source, spec):
         if not isinstance(stem_source, np.ndarray):
-            stem_source = self.spec_to_wav(spec).T
+            stem_source = self.spec_to_wav(spec, length=self._model_output_length).T
             if self.model_samplerate != 44100:
                 stem_source = spec_utils.resample_audio(stem_source.T, orig_sr=self.model_samplerate, target_sr=44100).T
         return stem_source.astype(np.float32, copy=False)
@@ -236,6 +237,11 @@ class VRSeparator(CommonSeparator):
         x_wave, x_spec_s = {}, {}
         bands_n = len(self.model_params.param["band"])
         base_wave = self._ensure_stereo(mix)
+        # Centered STFT needs a right-hand frame to reconstruct samples after
+        # the last hop; otherwise ISTFT rounds the tail down to that hop.
+        final_band = self.model_params.param["band"][bands_n]
+        right_context = math.ceil(final_band["hl"] * sample_rate / final_band["sr"])
+        base_wave = np.pad(base_wave, ((0, 0), (0, right_context)))
 
         iterator = tqdm(range(bands_n, 0, -1), leave=False, desc="Processing VR bands") if self.debug else range(bands_n, 0, -1)
         for d in iterator:
@@ -443,7 +449,7 @@ class VRSeparator(CommonSeparator):
 
         return postprocess(mask, x_spec)
 
-    def spec_to_wav(self, spec):
+    def spec_to_wav(self, spec, length=None):
         if self.high_end_process and isinstance(self.input_high_end, np.ndarray) and self.input_high_end_h:
             input_high_end = spec_utils.mirroring("mirroring", spec, self.input_high_end, self.model_params)
             return spec_utils.cmb_spectrogram_to_wave(
@@ -453,7 +459,8 @@ class VRSeparator(CommonSeparator):
                 input_high_end,
                 is_v51_model=self.is_vr_51_model,
                 torch_device=self.torch_device,
+                length=length,
             )
         return spec_utils.cmb_spectrogram_to_wave(
-            spec, self.model_params, is_v51_model=self.is_vr_51_model, torch_device=self.torch_device
+            spec, self.model_params, is_v51_model=self.is_vr_51_model, torch_device=self.torch_device, length=length
         )
