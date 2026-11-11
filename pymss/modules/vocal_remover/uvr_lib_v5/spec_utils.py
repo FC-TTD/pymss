@@ -232,7 +232,7 @@ def _torch_stft(wave, n_fft, hop_length, device):
     return np.asfortranarray(spec.cpu().numpy())
 
 
-def _torch_istft(spec, hop_length, device):
+def _torch_istft(spec, hop_length, device, length=None):
     device_type = None if device is None else torch.device(device).type
     if device_type not in ("cuda", "npu"):
         return None
@@ -249,17 +249,18 @@ def _torch_istft(spec, hop_length, device):
             window=window,
             center=True,
             return_complex=False,
+            length=length,
         )
     else:
-        wave = torch.istft(spec_t, n_fft=n_fft, hop_length=hop_length, window=window, center=True, return_complex=False)
+        wave = torch.istft(spec_t, n_fft=n_fft, hop_length=hop_length, window=window, center=True, length=length, return_complex=False)
     return np.asfortranarray(wave.cpu().numpy())
 
 
-def spectrogram_to_wave(spec, hop_length=1024, mp=None, band=0, is_v51_model=True, torch_device=None):
-    wave = _torch_istft(spec, hop_length, torch_device)
+def spectrogram_to_wave(spec, hop_length=1024, mp=None, band=0, is_v51_model=True, torch_device=None, length=None):
+    wave = _torch_istft(spec, hop_length, torch_device, length=length)
     if wave is None:
-        left = librosa.istft(np.asfortranarray(spec[0]), hop_length=hop_length, dtype=np.float64)
-        right = librosa.istft(np.asfortranarray(spec[1]), hop_length=hop_length, dtype=np.float64)
+        left = librosa.istft(np.asfortranarray(spec[0]), hop_length=hop_length, dtype=np.float64, length=length)
+        right = librosa.istft(np.asfortranarray(spec[1]), hop_length=hop_length, dtype=np.float64, length=length)
     else:
         left, right = wave[0], wave[1]
 
@@ -282,12 +283,25 @@ def spectrogram_to_wave(spec, hop_length=1024, mp=None, band=0, is_v51_model=Tru
     return np.asfortranarray([left, right])
 
 
-def cmb_spectrogram_to_wave(spec_m, mp, extra_bins_h=None, extra_bins=None, is_v51_model=False, torch_device=None):
+def cmb_spectrogram_to_wave(spec_m, mp, extra_bins_h=None, extra_bins=None, is_v51_model=False, torch_device=None, length=None):
     spec_m = np.where(np.isnan(spec_m), 0, spec_m)
     extra_bins_h = None if extra_bins_h is None else int(extra_bins_h)
     extra_bins = None if extra_bins is None else np.where(np.isnan(extra_bins), 0, extra_bins)
 
     bands_n = len(mp.param["band"])
+    final_sr = mp.param["band"][bands_n]["sr"]
+
+    def band_length(band):
+        return None if length is None else round(length * band["sr"] / final_sr)
+
+    def align_length(audio, expected):
+        if expected is None or audio.shape[-1] == expected:
+            return audio
+        if abs(audio.shape[-1] - expected) > 1:
+            raise ValueError("VR band resampling changed the audio duration")
+        if audio.shape[-1] > expected:
+            return audio[..., :expected]
+        return np.pad(audio, [(0, 0)] * (audio.ndim - 1) + [(0, 1)], mode="edge")
     offset = 0
     wave = None
 
@@ -307,7 +321,7 @@ def cmb_spectrogram_to_wave(spec_m, mp, extra_bins_h=None, extra_bins=None, is_v
                     if is_v51_model
                     else fft_hp_filter(spec_s, bp["hpf_start"], bp["hpf_stop"] - 1)
                 )
-            band_wave = spectrogram_to_wave(spec_s, bp["hl"], mp, d, is_v51_model, torch_device=torch_device)
+            band_wave = spectrogram_to_wave(spec_s, bp["hl"], mp, d, is_v51_model, torch_device=torch_device, length=band_length(bp))
             wave = band_wave if wave is None else np.add(wave, band_wave)
         else:
             sr = mp.param["band"][d + 1]["sr"]
@@ -318,11 +332,12 @@ def cmb_spectrogram_to_wave(spec_m, mp, extra_bins_h=None, extra_bins=None, is_v
                     else fft_lp_filter(spec_s, bp["lpf_start"], bp["lpf_stop"])
                 )
                 wave = resample_audio(
-                    spectrogram_to_wave(spec_s, bp["hl"], mp, d, is_v51_model, torch_device=torch_device),
+                    spectrogram_to_wave(spec_s, bp["hl"], mp, d, is_v51_model, torch_device=torch_device, length=band_length(bp)),
                     orig_sr=bp["sr"],
                     target_sr=sr,
                     res_type=wav_resolution,
                 )
+                wave = align_length(wave, band_length(mp.param["band"][d + 1]))
             else:
                 if is_v51_model:
                     spec_s *= get_hp_filter_mask(spec_s.shape[1], bp["hpf_start"], bp["hpf_stop"] - 1)
@@ -331,11 +346,12 @@ def cmb_spectrogram_to_wave(spec_m, mp, extra_bins_h=None, extra_bins=None, is_v
                     spec_s = fft_hp_filter(spec_s, bp["hpf_start"], bp["hpf_stop"] - 1)
                     spec_s = fft_lp_filter(spec_s, bp["lpf_start"], bp["lpf_stop"])
                 wave = resample_audio(
-                    np.add(wave, spectrogram_to_wave(spec_s, bp["hl"], mp, d, is_v51_model, torch_device=torch_device)),
+                    np.add(wave, spectrogram_to_wave(spec_s, bp["hl"], mp, d, is_v51_model, torch_device=torch_device, length=band_length(bp))),
                     orig_sr=bp["sr"],
                     target_sr=sr,
                     res_type=wav_resolution,
                 )
+                wave = align_length(wave, band_length(mp.param["band"][d + 1]))
 
     return wave
 
