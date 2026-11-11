@@ -19,6 +19,9 @@ from test.test_hub_batch import Runtime
 
 CASES = [
     ("dialogue-vocal", "melband_roformer_instvox_duality_v2.ckpt", ("Vocals", "Instrumental")),
+    ("film-dialogue-deux", "becruily_deux.ckpt", ("Vocals", "Instrumental")),
+    ("karaoke-anvuew", "bs_roformer_karaoke_anvuew.ckpt", ("Vocals", "Instrumental")),
+    ("karaoke-becruily", "mel_band_roformer_karaoke_becruily.ckpt", ("Vocals", "Instrumental")),
     ("dialogue-vocal-b", "mel_band_roformer_vocals_becruily.ckpt", ("vocals", "other")),
     ("instrumental-quality", "big_beta5e.ckpt", ("vocals", "other")),
     ("instrumental-separation", "mel_band_roformer_instrumental_becruily.ckpt", ("Instrumental", "Vocals")),

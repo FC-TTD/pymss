@@ -897,6 +897,294 @@
         "encoding": "PCM_24",
         "description": "Default WAV export; options.audio_params selects the effective per-input media contract."
       }
+    },
+    {
+      "name": "film-dialogue-deux",
+      "version": "2026-10-28.v2",
+      "dag": "film-dialogue-deux-2026-10-28-v2",
+      "outputs": [
+        "Vocals",
+        "Instrumental"
+      ],
+      "models": [
+        "becruily_deux.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {
+        "audio_params": {
+          "channels": {
+            "default": 2,
+            "enum": [
+              1,
+              2,
+              "source"
+            ],
+            "description": "Export channels; source preserves mono/stereo input. Mono to stereo duplicates the exported channel, not native stereo inference."
+          },
+          "sample_rate": {
+            "type": "integer",
+            "default": 48000,
+            "minimum": 8000,
+            "maximum": 192000
+          },
+          "wav_bit_depth": {
+            "type": "string",
+            "default": "PCM_24",
+            "enum": [
+              "PCM_16",
+              "PCM_24",
+              "PCM_32",
+              "FLOAT"
+            ]
+          }
+        }
+      },
+      "implementation": {
+        "dag_sha256": "f9ddea3469ccc97b768c149a8fdb2debd5d9245ea1f1534d66c9d7c80ebeb132",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "becruily_deux.ckpt",
+            "relpath": "vocal/vocal_instrumental_dual/becruily_deux.ckpt",
+            "sha256": "10255c02295bf3e3865d4ee50ff752d7b19b124ed5fd93b147babc4333eda3aa",
+            "size_bytes": 435006815
+          },
+          {
+            "kind": "config",
+            "model": "becruily_deux.ckpt",
+            "relpath": "vocal/vocal_instrumental_dual/becruily_deux.yaml",
+            "sha256": "e85f6bf311613afda7bb20fa1675fc37bba037eea7521b052b3b2b44cf7bb670",
+            "size_bytes": 1133
+          }
+        ],
+        "native_audio": {
+          "channels": 2,
+          "stereo_input": "native stereo inference",
+          "mono_input": "preserved; export conversion is separate"
+        }
+      },
+      "output_roles": [
+        {
+          "native_stem": "Vocals",
+          "role": "dialogue",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "Instrumental",
+          "role": "background",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2,
+        "encoding": "PCM_24",
+        "description": "Default WAV export; options.audio_params selects the effective per-input media contract."
+      }
+    },
+    {
+      "name": "karaoke-anvuew",
+      "version": "2026-10-28.v2",
+      "dag": "karaoke-anvuew-2026-10-28-v2",
+      "outputs": [
+        "Vocals",
+        "Instrumental"
+      ],
+      "models": [
+        "bs_roformer_karaoke_anvuew.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {
+        "audio_params": {
+          "channels": {
+            "default": 2,
+            "enum": [
+              1,
+              2,
+              "source"
+            ],
+            "description": "Export channels; source preserves mono/stereo input. Mono to stereo duplicates the exported channel, not native stereo inference."
+          },
+          "sample_rate": {
+            "type": "integer",
+            "default": 48000,
+            "minimum": 8000,
+            "maximum": 192000
+          },
+          "wav_bit_depth": {
+            "type": "string",
+            "default": "PCM_24",
+            "enum": [
+              "PCM_16",
+              "PCM_24",
+              "PCM_32",
+              "FLOAT"
+            ]
+          }
+        }
+      },
+      "implementation": {
+        "dag_sha256": "16302ebf03bdcd718161ce0527a466e0c29cd6d958d54cea350089f7c7c5543e",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "bs_roformer_karaoke_anvuew.ckpt",
+            "relpath": "karaoke/bs_roformer_karaoke_anvuew.ckpt",
+            "sha256": "206d04757cb5f75ca3b55f8a0a48f5c26aa2351d4ff3c7adbfc9affa30ea3ae4",
+            "size_bytes": 204486925
+          },
+          {
+            "kind": "config",
+            "model": "bs_roformer_karaoke_anvuew.ckpt",
+            "relpath": "karaoke/bs_roformer_karaoke_anvuew.yaml",
+            "sha256": "14d6df6dcf9ddf2eb27f60aa3f26ba3e614996747e291ed46cd70bf453adf722",
+            "size_bytes": 1978
+          }
+        ],
+        "native_audio": {
+          "channels": 2,
+          "stereo_input": "native stereo inference",
+          "mono_input": "preserved; export conversion is separate"
+        }
+      },
+      "output_roles": [
+        {
+          "native_stem": "Vocals",
+          "role": "vocals",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "Instrumental",
+          "role": "backing",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2,
+        "encoding": "PCM_24",
+        "description": "Default WAV export; options.audio_params selects the effective per-input media contract."
+      }
+    },
+    {
+      "name": "karaoke-becruily",
+      "version": "2026-10-28.v2",
+      "dag": "karaoke-becruily-2026-10-28-v2",
+      "outputs": [
+        "Vocals",
+        "Instrumental"
+      ],
+      "models": [
+        "mel_band_roformer_karaoke_becruily.ckpt"
+      ],
+      "max_concurrency": 1,
+      "memory_budget_bytes": null,
+      "options": {
+        "audio_params": {
+          "channels": {
+            "default": 2,
+            "enum": [
+              1,
+              2,
+              "source"
+            ],
+            "description": "Export channels; source preserves mono/stereo input. Mono to stereo duplicates the exported channel, not native stereo inference."
+          },
+          "sample_rate": {
+            "type": "integer",
+            "default": 48000,
+            "minimum": 8000,
+            "maximum": 192000
+          },
+          "wav_bit_depth": {
+            "type": "string",
+            "default": "PCM_24",
+            "enum": [
+              "PCM_16",
+              "PCM_24",
+              "PCM_32",
+              "FLOAT"
+            ]
+          }
+        }
+      },
+      "implementation": {
+        "dag_sha256": "9cd838db4970787be3b2c26ea9739fed80c6a9cd64bbd219e8b3e75d101da529",
+        "assets": [
+          {
+            "kind": "weights",
+            "model": "mel_band_roformer_karaoke_becruily.ckpt",
+            "relpath": "karaoke/mel_band_roformer_karaoke_becruily.ckpt",
+            "sha256": "d3aa262ac01df870b9fc033e9c7b6cad33fe04fc9c148b6c40841326a515a0e0",
+            "size_bytes": 1719139254
+          },
+          {
+            "kind": "config",
+            "model": "mel_band_roformer_karaoke_becruily.ckpt",
+            "relpath": "karaoke/mel_band_roformer_karaoke_becruily.yaml",
+            "sha256": "44ab76641ec1e0697d5cc814f5dbe940c9e4473187f6a2a535e2e7eaaaf20cdf",
+            "size_bytes": 1746
+          }
+        ],
+        "native_audio": {
+          "channels": 2,
+          "stereo_input": "native stereo inference",
+          "mono_input": "preserved; export conversion is separate"
+        }
+      },
+      "output_roles": [
+        {
+          "native_stem": "Vocals",
+          "role": "vocals",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        },
+        {
+          "native_stem": "Instrumental",
+          "role": "backing",
+          "required": true,
+          "media_type": "audio/wav",
+          "formats": [
+            "wav"
+          ]
+        }
+      ],
+      "output_media": {
+        "media_type": "audio/wav",
+        "container": "wav",
+        "sample_rate": 48000,
+        "bits_per_sample": 24,
+        "channels": 2,
+        "encoding": "PCM_24",
+        "description": "Default WAV export; options.audio_params selects the effective per-input media contract."
+      }
     }
   ]
 }
