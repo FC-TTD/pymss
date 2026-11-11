@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+# Add the reviewed film/karaoke Profiles and the VR tail-frame fix to the
+# accepted worker-only Provider image. Its CUDA, Torch, SDK and core stay pinned.
+FROM registry.ttd/pymss/hub@sha256:e39047593811fbf511d8f065f2fd0e71e16ce4301731139ad7711e4ae85fb5db
+ARG SOURCE_REV
+WORKDIR /opt/pymss-fork
+COPY --link hub_batch/profiles-2026-10-28.json ./hub_batch/profiles-2026-10-28.json
+COPY --link hub_batch/recipes/film-dialogue-deux-2026-10-28-v2.json ./hub_batch/recipes/
+COPY --link hub_batch/recipes/karaoke-anvuew-2026-10-28-v2.json ./hub_batch/recipes/
+COPY --link hub_batch/recipes/karaoke-becruily-2026-10-28-v2.json ./hub_batch/recipes/
+COPY --link pymss/modules/vocal_remover/uvr_lib_v5/spec_utils.py ./pymss/modules/vocal_remover/uvr_lib_v5/
+COPY --link pymss/modules/vocal_remover/vr_separator.py ./pymss/modules/vocal_remover/
+RUN python -m hub_runtime describe > /opt/pymss-fork/hub_runtime/contract.json
+LABEL org.opencontainers.image.source="https://github.com/FC-TTD/pymss" org.opencontainers.image.revision="${SOURCE_REV}"
